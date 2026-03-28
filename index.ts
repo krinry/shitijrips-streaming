@@ -19,7 +19,7 @@ import { BigFile } from "telegram/client/uploads.js";
 import cors from "cors";
 
 // Configuration
-const PORT = 3030;
+const PORT = parseInt(process.env.PORT || "3030");
 const CHUNK_SIZE = 1024 * 1024; // 1MB chunks
 const MAX_RETRIES = 3;
 const RETRY_DELAY = 1000; // 1 second
