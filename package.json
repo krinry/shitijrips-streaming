@@ -9,6 +9,7 @@
     "start:node": "bun index.js"
   },
   "dependencies": {
+    "big-integer": "^1.6.52",
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
     "esbuild": "^0.20.0",

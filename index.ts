@@ -15,11 +15,11 @@
 import { serve } from "bun";
 import { TelegramClient } from "telegram";
 import { StringSession } from "telegram/sessions/index.js";
-import { BigFile } from "telegram/client/uploads.js";
 import cors from "cors";
+import BigInteger from "big-integer";
 
 // Configuration
-const PORT = parseInt(process.env.PORT || "3030");
+const PORT = parseInt(process.env.PORT || "3031");
 const CHUNK_SIZE = 1024 * 1024; // 1MB chunks
 const MAX_RETRIES = 3;
 const RETRY_DELAY = 1000; // 1 second
@@ -104,21 +104,97 @@ async function getFileSize(
     }
 
     // Get the message to extract file size
-    const messages = await telegramClient.getMessages(channelId, {
-      ids: [parseInt(messageId)],
-    });
+    // For private channels, use the string format directly
+    console.log("Fetching message:", messageId, "from channel:", channelId);
+    const response = await telegramClient.getMessages(
+      channelId, // Pass as string, client will resolve
+      { ids: [parseInt(messageId)] }
+    );
+
+    // Handle both array and object response formats
+    let messages;
+    if (Array.isArray(response)) {
+      messages = response;
+    } else if (response && typeof response === 'object') {
+      // Check if it's array-like with numeric keys
+      if ('0' in response && response.messages) {
+        messages = Array.isArray(response.messages) ? response.messages : [];
+      } else {
+        // Try to convert array-like object
+        messages = Object.values(response).filter(v => v && typeof v === 'object' && 'className' in v);
+      }
+    } else {
+      messages = [];
+    }
+    console.log("Messages returned:", messages?.length, "Type:", typeof messages, "Response:", response ? Object.keys(response) : null);
+    if (messages && messages.length > 0 && messages[0]) {
+      console.log("First message keys:", Object.keys(messages[0]));
+    }
 
     if (!messages || messages.length === 0) {
       throw new Error("Message not found");
     }
 
     const message = messages[0];
-    if (!message || !("media" in message) || !message.media) {
+    
+    // Debug: Log message structure
+    console.log("Message type:", message.className);
+    console.log("Has media?", "media" in message);
+    console.log("Has document?", "document" in message);
+    
+    // Try different ways to get media
+    console.log("Message class name:", message.className);
+    console.log("Message keys:", Object.keys(message));
+    
+    let media = null;
+    
+    // Check for different media types
+    if ("media" in message) {
+      media = (message as any).media;
+      console.log("Found media property");
+    } else if ("document" in message) {
+      media = (message as any).document;
+      console.log("Found document property");
+    } else if ("photo" in message) {
+      media = (message as any).photo;
+      console.log("Found photo property");
+    } else if ("video" in message) {
+      media = (message as any).video;
+      console.log("Found video property");
+    } else if ("animation" in message) {
+      media = (message as any).animation;
+      console.log("Found animation property");
+    } else if ("sticker" in message) {
+      media = (message as any).sticker;
+      console.log("Found sticker property");
+    } else {
+      console.log("No known media properties found");
+    }
+    
+    console.log("Media object:", media);
+    console.log("Media keys:", media ? Object.keys(media) : null);
+    
+    if (!media) {
       throw new Error("No media found in message");
     }
-
-    const media = message.media as any;
-    const size = media.document?.size || media.photo?.sizes?.pop()?.size || 0;
+    
+    // Get file size - handle BigInteger from telegram library
+    let size = 0;
+    const doc = media.document;
+    if (doc) {
+      const docSize = doc.size;
+      if (docSize && typeof docSize === 'object' && 'value' in docSize) {
+        // It's a BigInteger with a value property
+        size = Number(docSize.value);
+      } else if (typeof docSize === 'bigint') {
+        size = Number(docSize);
+      } else if (typeof docSize === 'number') {
+        size = docSize;
+      } else if (typeof docSize === 'string') {
+        size = parseInt(docSize, 10);
+      }
+    }
+    console.log("File size:", size, "bytes");
 
     // Cache the file size
     fileSizeCache.set(cacheKey, { size, timestamp: Date.now() });
@@ -197,16 +273,42 @@ async function downloadChunkFromMessage(
     }
 
     // Get the message with the file
-    const messages = await telegramClient.getMessages(channelId, {
-      ids: [parseInt(messageId)],
-    });
+    const response = await telegramClient.getMessages(
+      channelId,
+      { ids: [parseInt(messageId)] }
+    );
+
+    // Handle both array and object response formats
+    let messages;
+    if (Array.isArray(response)) {
+      messages = response;
+    } else if (response && typeof response === 'object') {
+      // Check if it's array-like with numeric keys
+      if ('0' in response && response.messages) {
+        messages = Array.isArray(response.messages) ? response.messages : [];
+      } else {
+        // Try to convert array-like object
+        messages = Object.values(response).filter(v => v && typeof v === 'object' && 'className' in v);
+      }
+    } else {
+      messages = [];
+    }
 
     if (!messages || messages.length === 0) {
       throw new Error("Message not found");
     }
 
     const message = messages[0];
+    
+    // Debug: Log what we got
+    console.log("Message response:", JSON.stringify(message, (key, value) => 
+      typeof value === 'bigint' ? value.toString() : value, 2));
+    
     if (!message || !("media" in message) || !message.media) {
+      // Check if it's a service message or other type
+      if ("message" in message) {
+        console.log("Message is text:", message.message);
+      }
       throw new Error("No media found in message");
     }
 
@@ -214,8 +316,9 @@ async function downloadChunkFromMessage(
     const chunks: Uint8Array[] = [];
     for await (const chunk of telegramClient.iterDownload({
       file: message.media as any,
-      offset,
+      offset: BigInteger(offset),
       limit,
+      requestSize: limit,
     })) {
       chunks.push(new Uint8Array(chunk));
     }
@@ -609,6 +712,7 @@ console.log(``);
 serve({
   port: PORT,
   fetch: handleRequest,
+  idleTimeout: 60,
 });
 
 console.log(`✅ Streaming Service running on http://localhost:${PORT}`);
