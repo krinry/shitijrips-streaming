@@ -5,9 +5,8 @@
   "type": "module",
   "scripts": {
     "dev": "bun --hot index.ts",
-    "build": "esbuild index.ts --platform=node --format=cjs --outfile=dist/index.js",
     "start": "bun index.ts",
-    "start:node": "node dist/index.js"
+    "start:node": "bun index.js"
   },
   "dependencies": {
     "cors": "^2.8.5",
