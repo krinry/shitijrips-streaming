@@ -431,14 +431,10 @@ async def stream_file(
             except RPCError as e:
                 err_str = str(e)
                 if "OFFSET_INVALID" in err_str or "LIMIT_INVALID" in err_str:
-                    if retries >= cfg.max_retries:
-                        log.error(f"❌ Offset/limit error after {retries} retries: {e}")
-                        raise
-                    retries += 1
-                    bytes_sent = 0
-                    log.warning(f"⚠️  Offset/limit error, retrying from start (attempt {retries})")
-                    await asyncio.sleep(1)
-                    continue
+                    # These errors at file end mean we're past the file boundary
+                    # Signal to stop streaming gracefully
+                    log.warning(f"⚠️  Offset past file boundary, stream complete")
+                    break
                 if retries >= cfg.max_retries:
                     raise
                 retries += 1
@@ -723,7 +719,8 @@ async def stream_video(
         )
 
     # Cap response size so browser gets data fast and seeks work immediately
-    capped_end   = min(range_req.end, file_size - 1)
+    # IMPORTANT: end must be < file_size (Telegram requirement)
+    capped_end   = min(range_req.end, file_size - 2)  # -2 to ensure end < file_size
     capped_range = RangeRequest(start=range_req.start, end=capped_end)
     content_len  = capped_range.length
 
