@@ -340,34 +340,72 @@ async def stream_file(
 
     try:
         while bytes_sent < total:
-            # Check browser disconnected
             if await request.is_disconnected():
                 log.info(f"  🛑 Client disconnected | sent={fmt_bytes(bytes_sent)}")
                 return
 
             try:
-                # Use smaller aligned chunks for Telegram API
-                # Telegram requires offset to be multiple of 4096 bytes
-                chunk_size = min(512 * 1024, total - bytes_sent)  # 512KB chunks
-                
+                current_offset = range_req.start + bytes_sent
+                remaining = total - bytes_sent
+
+                # Align offset to 4096 bytes (Telegram requirement)
+                aligned_offset = (current_offset // 4096) * 4096
+
+                # Calculate limit - must be at least 4096 for Telegram
+                # but also should respect what the browser actually needs
+                if aligned_offset > current_offset:
+                    # We're aligning back, so we need extra bytes
+                    adjusted_offset = aligned_offset
+                    adjusted_limit = current_offset - aligned_offset + remaining
+                else:
+                    adjusted_offset = current_offset
+                    adjusted_limit = remaining
+
+                # Ensure limit is at least 4096 (Telegram minimum)
+                # But cap at 512KB to avoid getting too much data
+                if adjusted_limit < 4096:
+                    adjusted_limit = 4096
+                elif adjusted_limit > 512 * 1024:
+                    adjusted_limit = 512 * 1024
+
+                log.info(f"  📥 Fetching | offset={fmt_bytes(adjusted_offset)} | limit={fmt_bytes(adjusted_limit)}")
+
                 async for chunk in tg.stream_media(
                     info.message,
-                    offset   = range_req.start + bytes_sent,
-                    limit    = chunk_size,
+                    offset = adjusted_offset,
+                    limit  = adjusted_limit,
                 ):
-                    # Check disconnect inside chunk loop too
                     if await request.is_disconnected():
                         log.info("  🛑 Disconnected mid-stream")
                         return
 
-                    yield chunk
-                    bytes_sent += len(chunk)
+                    # Calculate how much of this chunk we actually need to send
+                    chunk_offset = adjusted_offset
+                    chunk_end = adjusted_offset + len(chunk)
+
+                    # Skip bytes before our actual start
+                    if chunk_offset < range_req.start:
+                        skip = range_req.start - chunk_offset
+                        chunk = chunk[skip:]
+                        chunk_offset = range_req.start
+
+                    # Don't send bytes beyond our range end
+                    if chunk_offset + len(chunk) > range_req.end + 1:
+                        keep = (range_req.end + 1) - chunk_offset
+                        if keep > 0:
+                            chunk = chunk[:keep]
+                        else:
+                            chunk = b""
+
+                    if chunk:
+                        yield chunk
+                        bytes_sent += len(chunk)
 
                     if bytes_sent >= total:
                         break
 
-                # Stream completed successfully
-                break
+                if bytes_sent >= total:
+                    break
 
             except (FileReferenceExpired, FileReferenceInvalid):
                 if retries >= cfg.max_retries:
@@ -384,13 +422,11 @@ async def stream_file(
 
             except RPCError as e:
                 err_str = str(e)
-                # OFFSET_INVALID - try with smaller aligned offset
                 if "OFFSET_INVALID" in err_str or "LIMIT_INVALID" in err_str:
                     if retries >= cfg.max_retries:
                         log.error(f"❌ Offset/limit error after {retries} retries: {e}")
                         raise
                     retries += 1
-                    # Reset bytes_sent to retry from start of range
                     bytes_sent = 0
                     log.warning(f"⚠️  Offset/limit error, retrying (attempt {retries})")
                     await asyncio.sleep(1)
