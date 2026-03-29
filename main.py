@@ -1,11 +1,11 @@
 """
-Telegram Video Streaming Service v4.1
-Python 3.11 + Pyrogram + FFmpeg + FastAPI
-
-FIXES:
-- PEER_ID_INVALID: startup pe channel resolve karo
-- Session string se channel peer cache build karo
-- Render restart pe bhi kaam kare
+Telegram Video Streaming Service v5.0
+======================================
+Bot Token approach:
+  ✅ AUTH_KEY_DUPLICATED never - bot multiple instances support karta hai
+  ✅ PEER_ID_INVALID never - bot channels resolve karta hai automatically  
+  ✅ Render restart pe kaam karta hai
+  ✅ Local + Render dono saath chal sakte hain
 """
 from __future__ import annotations
 
@@ -31,7 +31,6 @@ from pyrogram.errors import (
     FloodWait,
     OffsetInvalid,
     RPCError,
-    PeerIdInvalid,
 )
 from pyrogram.types import Message
 
@@ -51,21 +50,26 @@ logging.getLogger("pyrogram").setLevel(logging.WARNING)
 
 @dataclass(frozen=True)
 class Config:
+    # Bot credentials (preferred)
+    bot_token:      str = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+
+    # Fallback: user session (not recommended)
+    session_string: str = os.environ.get("TELEGRAM_SESSION_STRING", "")
+
     api_id:         int = int(os.environ.get("TELEGRAM_API_ID", "0"))
     api_hash:       str = os.environ.get("TELEGRAM_API_HASH", "")
-    session_string: str = os.environ.get("TELEGRAM_SESSION_STRING", "")
     channel_id:     str = os.environ.get("TELEGRAM_CHANNEL_ID", "")
     port:           int = int(os.environ.get("PORT", "10000"))
 
-    pyrogram_chunk_bytes: int = 1024 * 1024
-    max_response_bytes:   int = 5 * 1024 * 1024
+    pyrogram_chunk_bytes: int = 1024 * 1024      # 1MB - DO NOT CHANGE
+    max_response_bytes:   int = 5 * 1024 * 1024  # 5MB per HTTP response
     demo_file_size:       int = 10 * 1024 * 1024
 
     max_concurrent_streams: int = 5
     requests_per_minute:    int = 120
     max_ip_log_size:        int = 5000
 
-    file_cache_ttl: int = 10 * 60
+    file_cache_ttl: int = 10 * 60  # 10 min
     max_cache_size: int = 500
 
     max_retries:      int   = 3
@@ -73,6 +77,15 @@ class Config:
 
     ffmpeg_path:    str = os.environ.get("FFMPEG_PATH", "ffmpeg")
     ffmpeg_threads: int = int(os.environ.get("FFMPEG_THREADS", "2"))
+
+    @property
+    def use_bot(self) -> bool:
+        return bool(self.bot_token)
+
+    @property
+    def is_configured(self) -> bool:
+        return bool(self.api_id and self.api_hash and
+                    (self.bot_token or self.session_string))
 
 
 cfg = Config()
@@ -86,8 +99,8 @@ BROWSER_NATIVE_MIME = {
 
 MIME_EXT_MAP = {
     "x-matroska": "mkv", "x-msvideo": "avi",
-    "quicktime": "mov",  "x-ms-wmv": "wmv",
-    "mpeg": "mpg",       "x-flv": "flv",
+    "quicktime":  "mov", "x-ms-wmv":  "wmv",
+    "mpeg":       "mpg", "x-flv":     "flv",
 }
 
 def needs_transcode(mime: str) -> bool:
@@ -128,7 +141,7 @@ class RangeReq:
 
 class RateLimiter:
     def __init__(self, rpm: int, max_ips: int):
-        self.rpm = rpm
+        self.rpm     = rpm
         self.max_ips = max_ips
         self._log: dict[str, list[float]] = defaultdict(list)
 
@@ -180,80 +193,77 @@ file_cache = FileCache(cfg.max_cache_size)
 
 # ─── Telegram Client ──────────────────────────────────────────────────────────
 
-tg = Client(
-    name           = "stream",
-    api_id         = cfg.api_id,
-    api_hash       = cfg.api_hash,
-    session_string = cfg.session_string or None,
-)
+def create_client() -> Client:
+    """
+    Bot token → preferred (no duplicate session issues)
+    Session string → fallback (user account)
+    """
+    if cfg.use_bot:
+        log.info("🤖 Using Bot Token mode")
+        return Client(
+            name      = "bot",
+            api_id    = cfg.api_id,
+            api_hash  = cfg.api_hash,
+            bot_token = cfg.bot_token,
+            # Bot handles multiple instances automatically
+            # No AUTH_KEY_DUPLICATED possible
+        )
+    else:
+        log.warning("👤 Using User Session mode (bot token preferred)")
+        return Client(
+            name           = "stream",
+            api_id         = cfg.api_id,
+            api_hash       = cfg.api_hash,
+            session_string = cfg.session_string,
+        )
 
-# Resolved channel peers cache
-# channel_id string → resolved peer object
-_resolved_channels: dict[str, any] = {}
+
+tg: Client = create_client()
+
+# Channel peer cache
+_channel_peers: dict[str, str] = {}
 
 
 async def resolve_channel(channel_id: str) -> str:
     """
-    THE FIX: Pyrogram needs to 'know' a peer before using it.
-    
-    Problem: New session string pe channel peer DB me nahi hota.
-             get_messages() directly call karne pe PEER_ID_INVALID aata hai.
-    
-    Fix: get_chat() se pehle channel resolve karo.
-         Yeh channel ko peer DB me add kar deta hai.
-         Phir get_messages() kaam karta hai.
+    Channel ko resolve karke peer cache me store karo.
+    Bot mode me yeh automatically kaam karta hai.
     """
-    if channel_id in _resolved_channels:
-        return channel_id
-
-    log.info(f"🔍 Resolving channel: {channel_id}")
+    if channel_id in _channel_peers:
+        return _channel_peers[channel_id]
 
     try:
-        # get_chat() peer ko session DB me register karta hai
-        chat = await tg.get_chat(channel_id)
+        chat        = await tg.get_chat(channel_id)
         resolved_id = str(chat.id)
-        
-        # Dono forms cache karo (with/without -100 prefix)
-        _resolved_channels[channel_id]  = True
-        _resolved_channels[resolved_id] = True
-        
-        log.info(
-            f"✅ Channel resolved: {channel_id} → "
-            f"{chat.title} (id={chat.id}, members={getattr(chat, 'members_count', 'N/A')})"
-        )
+
+        _channel_peers[channel_id]  = resolved_id
+        _channel_peers[resolved_id] = resolved_id
+
+        log.info(f"✅ Channel: {chat.title} (id={resolved_id})")
         return resolved_id
 
     except Exception as e:
         log.error(f"❌ Cannot resolve channel '{channel_id}': {e}")
         raise ValueError(
             f"Cannot access channel '{channel_id}'. "
-            "Make sure the account is a member of this channel."
+            f"{'Add bot as admin in channel.' if cfg.use_bot else 'Check session.'}"
         )
 
 
-async def warm_up_channels():
-    """
-    Startup pe saare configured channels resolve karo.
-    Yeh ensure karta hai ki restart ke baad bhi channels accessible hon.
-    """
-    channels_to_resolve = []
+async def warm_up():
+    """Startup pe channels aur bot info resolve karo."""
+    me = await tg.get_me()
+
+    if cfg.use_bot:
+        log.info(f"🤖 Bot: @{me.username} (id={me.id})")
+    else:
+        log.info(f"👤 User: {me.first_name} (@{me.username})")
 
     if cfg.channel_id:
-        channels_to_resolve.append(cfg.channel_id)
-
-    if not channels_to_resolve:
-        log.warning("⚠️  No TELEGRAM_CHANNEL_ID configured")
-        return
-
-    log.info(f"🔥 Warming up {len(channels_to_resolve)} channel(s)...")
-
-    for cid in channels_to_resolve:
         try:
-            await resolve_channel(cid)
+            await resolve_channel(cfg.channel_id)
         except Exception as e:
-            log.warning(f"  ⚠️  Could not warm up {cid}: {e}")
-
-    log.info("✅ Channel warm-up complete")
+            log.warning(f"⚠️  Could not resolve default channel: {e}")
 
 # ─── File Info ────────────────────────────────────────────────────────────────
 
@@ -278,18 +288,9 @@ async def fetch_file_info(message_id: int, channel_id: str) -> FileInfo:
     if cached:
         return cached
 
-    # Resolve channel first (fixes PEER_ID_INVALID)
-    resolved_cid = await resolve_channel(channel_id)
+    resolved = await resolve_channel(channel_id)
 
-    try:
-        msg = await tg.get_messages(resolved_cid, message_id)
-    except PeerIdInvalid:
-        # Force re-resolve and retry once
-        _resolved_channels.pop(channel_id, None)
-        _resolved_channels.pop(resolved_cid, None)
-        resolved_cid = await resolve_channel(channel_id)
-        msg = await tg.get_messages(resolved_cid, message_id)
-
+    msg = await tg.get_messages(resolved, message_id)
     if isinstance(msg, list):
         msg = msg[0] if msg else None
 
@@ -309,7 +310,7 @@ async def fetch_file_info(message_id: int, channel_id: str) -> FileInfo:
 
     info = FileInfo(
         message_id      = message_id,
-        channel_id      = resolved_cid,
+        channel_id      = resolved,
         file_id         = getattr(doc, "file_id", ""),
         file_size       = file_size,
         mime_type       = mime,
@@ -333,11 +334,10 @@ async def refresh_file_info(info: FileInfo) -> FileInfo:
     file_cache.invalidate(info.cache_key())
     return await fetch_file_info(info.message_id, info.channel_id)
 
-# ─── Active Streams ───────────────────────────────────────────────────────────
+# ─── Streams ──────────────────────────────────────────────────────────────────
 
 _active_streams = 0
 
-# ─── Direct Stream ────────────────────────────────────────────────────────────
 
 async def stream_direct(
     info:      FileInfo,
@@ -361,7 +361,6 @@ async def stream_direct(
     try:
         while bytes_sent < total:
             if await request.is_disconnected():
-                log.info(f"  🛑 Disconnected | sent={fmt_bytes(bytes_sent)}")
                 return
 
             try:
@@ -390,7 +389,6 @@ async def stream_direct(
 
                     if bytes_sent >= total:
                         break
-
                 break
 
             except (FileReferenceExpired, FileReferenceInvalid):
@@ -403,7 +401,6 @@ async def stream_direct(
                 await asyncio.sleep(e.value + 1)
 
             except OffsetInvalid:
-                log.info("  📄 EOF")
                 break
 
             except RPCError as e:
@@ -417,7 +414,6 @@ async def stream_direct(
     finally:
         _active_streams -= 1
 
-# ─── Transcode Stream ─────────────────────────────────────────────────────────
 
 async def stream_transcode(
     info:    FileInfo,
@@ -436,8 +432,7 @@ async def stream_transcode(
         "-c:v", "copy",
         "-c:a", "aac", "-b:a", "128k",
         "-movflags", "frag_keyframe+empty_moov+default_base_moof",
-        "-f", "mp4",
-        "pipe:1",
+        "-f", "mp4", "pipe:1",
     ]
 
     proc = None
@@ -449,33 +444,30 @@ async def stream_transcode(
             stderr = asyncio.subprocess.PIPE,
         )
 
-        async def feed_ffmpeg():
+        async def feed():
             try:
-                async for raw_chunk in tg.stream_media(info.message, offset=0):
+                async for chunk in tg.stream_media(info.message, offset=0):
                     if proc.returncode is not None:
                         break
-                    if proc.stdin:
-                        try:
-                            proc.stdin.write(raw_chunk)
-                            await proc.stdin.drain()
-                        except (BrokenPipeError, ConnectionResetError):
-                            break
-            except Exception as e:
-                log.warning(f"  Feed error: {e}")
-            finally:
-                if proc.stdin:
                     try:
-                        proc.stdin.close()
-                    except Exception:
-                        pass
+                        proc.stdin.write(chunk)
+                        await proc.stdin.drain()
+                    except (BrokenPipeError, ConnectionResetError):
+                        break
+            except Exception as e:
+                log.warning(f"  Feed: {e}")
+            finally:
+                try:
+                    proc.stdin.close()
+                except Exception:
+                    pass
 
-        feed_task  = asyncio.create_task(feed_ffmpeg())
+        feed_task  = asyncio.create_task(feed())
         bytes_sent = 0
 
         try:
             while True:
                 if await request.is_disconnected():
-                    log.info("  🛑 Client disconnected")
                     break
                 chunk = await proc.stdout.read(65536)
                 if not chunk:
@@ -489,7 +481,7 @@ async def stream_transcode(
             except asyncio.CancelledError:
                 pass
 
-        log.info(f"  ✅ Transcode done | sent={fmt_bytes(bytes_sent)}")
+        log.info(f"  ✅ Transcode | sent={fmt_bytes(bytes_sent)}")
 
     except Exception as e:
         log.error(f"  ❌ Transcode error: {e}")
@@ -503,7 +495,7 @@ async def stream_transcode(
                 pass
         _active_streams -= 1
 
-# ─── FFmpeg Check ─────────────────────────────────────────────────────────────
+# ─── FFmpeg ───────────────────────────────────────────────────────────────────
 
 async def check_ffmpeg() -> bool:
     try:
@@ -527,9 +519,8 @@ def parse_range(header: str, file_size: int) -> Optional[RangeReq]:
         return None
     s, e = m.group(1), m.group(2)
     if s == "" and e != "":
-        suffix = int(e)
-        start  = max(0, file_size - suffix)
-        end    = file_size - 1
+        start = max(0, file_size - int(e))
+        end   = file_size - 1
     elif s != "":
         start = int(s)
         end   = int(e) if e else file_size - 1
@@ -540,46 +531,43 @@ def parse_range(header: str, file_size: int) -> Optional[RangeReq]:
         return None
     return RangeReq(start=start, end=end)
 
-# ─── FastAPI ──────────────────────────────────────────────────────────────────
+# ─── App ──────────────────────────────────────────────────────────────────────
 
 ffmpeg_available = False
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global ffmpeg_available
+    global ffmpeg_available, tg
 
     log.info("🚀 Starting...")
 
-    if cfg.api_id and cfg.api_hash and cfg.session_string:
+    if cfg.is_configured:
+        # Recreate client fresh (avoids stale state)
+        tg = create_client()
         await tg.start()
-        me = await tg.get_me()
-        log.info(f"✅ Telegram: {me.first_name} (@{me.username})")
-
-        # THE FIX: Startup pe channel resolve karo
-        await warm_up_channels()
+        await warm_up()
     else:
-        log.warning("⚠️  Telegram not configured → demo mode")
+        log.warning("⚠️  Not configured → demo mode")
 
     ffmpeg_available = await check_ffmpeg()
-    if ffmpeg_available:
-        log.info(f"✅ FFmpeg ready")
-    else:
-        log.warning(f"⚠️  FFmpeg not found at '{cfg.ffmpeg_path}'")
+    log.info(f"{'✅' if ffmpeg_available else '⚠️ '} FFmpeg: {cfg.ffmpeg_path}")
 
     yield
 
     log.info("👋 Shutting down...")
-    if tg.is_connected:
-        await tg.stop()
+    try:
+        if tg.is_connected:
+            await tg.stop()
+    except Exception:
+        pass
 
 
 app = FastAPI(
-    title     = "Telegram Streaming",
-    version   = "4.1.0",
-    lifespan  = lifespan,
-    docs_url  = "/docs",
-    redoc_url = None,
+    title    = "Telegram Streaming",
+    version  = "5.0.0",
+    lifespan = lifespan,
+    docs_url = "/docs",
 )
 
 app.add_middleware(
@@ -588,13 +576,11 @@ app.add_middleware(
     allow_methods  = ["GET", "HEAD", "OPTIONS"],
     allow_headers  = ["Range", "Content-Type", "Accept"],
     expose_headers = [
-        "Content-Range", "Accept-Ranges", "Content-Length",
-        "Content-Type", "Content-Disposition",
+        "Content-Range", "Accept-Ranges",
+        "Content-Length", "Content-Type", "Content-Disposition",
     ],
     max_age = 86400,
 )
-
-# ─── Middleware ───────────────────────────────────────────────────────────────
 
 SKIP_RL = {"/health", "/docs", "/openapi.json"}
 
@@ -607,7 +593,6 @@ async def rate_limit_mw(request: Request, call_next):
             or (request.client.host if request.client else "unknown")
         )
         if not rate_limiter.is_allowed(ip):
-            log.warning(f"🚫 Rate limit: {ip}")
             return Response(
                 '{"error":"Too many requests"}',
                 status_code = 429,
@@ -620,14 +605,14 @@ async def rate_limit_mw(request: Request, call_next):
 @app.get("/health")
 async def health():
     return {
-        "status"           : "ok",
-        "telegram"         : tg.is_connected,
-        "ffmpeg"           : ffmpeg_available,
-        "active_streams"   : _active_streams,
-        "cached_files"     : len(file_cache),
-        "resolved_channels": list(_resolved_channels.keys()),
-        "port"             : cfg.port,
-        "timestamp"        : time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "status"         : "ok",
+        "mode"           : "bot" if cfg.use_bot else "user",
+        "telegram"       : tg.is_connected,
+        "ffmpeg"         : ffmpeg_available,
+        "active_streams" : _active_streams,
+        "cached_files"   : len(file_cache),
+        "channels"       : list(set(_channel_peers.values())),
+        "timestamp"      : time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
 
 
@@ -650,8 +635,6 @@ async def file_info(
     except Exception as e:
         raise HTTPException(500, str(e))
 
-    effective_mime = "video/mp4" if info.needs_transcode else info.mime_type
-
     return {
         "messageId"         : info.message_id,
         "channelId"         : info.channel_id,
@@ -659,7 +642,7 @@ async def file_info(
         "fileSize"          : info.file_size,
         "fileSizeFormatted" : fmt_bytes(info.file_size),
         "mimeType"          : info.mime_type,
-        "effectiveMime"     : effective_mime,
+        "effectiveMime"     : "video/mp4" if info.needs_transcode else info.mime_type,
         "needsTranscode"    : info.needs_transcode,
         "ffmpegAvailable"   : ffmpeg_available,
         "dcId"              : info.dc_id,
@@ -668,7 +651,7 @@ async def file_info(
 
 
 @app.api_route("/stream/{message_id}", methods=["GET", "HEAD"])
-async def stream(
+async def stream_route(
     message_id : int,
     request    : Request,
     channel    : str = Query(""),
@@ -695,7 +678,7 @@ async def stream(
         log.error(f"Fetch error: {e}")
         raise HTTPException(500, str(e))
 
-    # Transcode path
+    # Transcode path (MKV/AVI → MP4)
     if info.needs_transcode:
         if not ffmpeg_available:
             raise HTTPException(501, f"FFmpeg not installed. Cannot play {info.mime_type}.")
@@ -709,7 +692,6 @@ async def stream(
         }
         if request.method == "HEAD":
             return Response(status_code=200, headers=headers)
-
         return StreamingResponse(
             content     = stream_transcode(info, request),
             status_code = 200,
@@ -717,7 +699,7 @@ async def stream(
             media_type  = "video/mp4",
         )
 
-    # Direct stream path
+    # Direct stream path (MP4/WebM)
     file_size = info.file_size
     rh        = request.headers.get("Range", "")
     range_req = parse_range(rh, file_size)
@@ -798,15 +780,16 @@ def _safe_name(name: str) -> str:
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    mode = "🤖 BOT" if cfg.use_bot else "👤 USER SESSION"
     print(f"Listening on http://0.0.0.0:{cfg.port}", flush=True)
     print(f"""
 ╔══════════════════════════════════════════╗
-║   Telegram Video Streaming v4.1         ║
+║   Telegram Streaming v5.0               ║
 ╠══════════════════════════════════════════╣
+║  Mode    : {mode:<30} ║
 ║  Port    : {cfg.port:<30} ║
 ║  API ID  : {str(cfg.api_id) if cfg.api_id else "⚠️  NOT SET":<30} ║
 ║  Channel : {cfg.channel_id or "⚠️  NOT SET":<30} ║
-║  FFmpeg  : {cfg.ffmpeg_path:<30} ║
 ╚══════════════════════════════════════════╝
 """, flush=True)
 

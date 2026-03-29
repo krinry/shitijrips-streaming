@@ -4,7 +4,8 @@
 .env.*.local
 
 /gen_session.session
-
+/bot.session
+/bot.session-journal
 # Python
 __pycache__/
 *.py[cod]
