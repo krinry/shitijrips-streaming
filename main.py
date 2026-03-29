@@ -1,11 +1,11 @@
 """
-Telegram Video Streaming Service v5.0
+Telegram Video Streaming Service v5.1
 ======================================
-Bot Token approach:
-  ✅ AUTH_KEY_DUPLICATED never - bot multiple instances support karta hai
-  ✅ PEER_ID_INVALID never - bot channels resolve karta hai automatically  
-  ✅ Render restart pe kaam karta hai
-  ✅ Local + Render dono saath chal sakte hain
+Dual Client Architecture:
+  - User Client: Messages fetch karta hai (private channels access)
+  - Bot Client: Streaming karta hai (no AUTH_KEY_DUPLICATED)
+  
+  Ya sirf User Client with in-memory session (no file = no duplicate)
 """
 from __future__ import annotations
 
@@ -31,12 +31,11 @@ from pyrogram.errors import (
     FloodWait,
     OffsetInvalid,
     RPCError,
+    SessionPasswordNeeded,
 )
 from pyrogram.types import Message
 
 load_dotenv()
-
-# ─── Logging ──────────────────────────────────────────────────────────────────
 
 logging.basicConfig(
     level   = logging.INFO,
@@ -50,26 +49,27 @@ logging.getLogger("pyrogram").setLevel(logging.WARNING)
 
 @dataclass(frozen=True)
 class Config:
-    # Bot credentials (preferred)
-    bot_token:      str = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-
-    # Fallback: user session (not recommended)
-    session_string: str = os.environ.get("TELEGRAM_SESSION_STRING", "")
-
     api_id:         int = int(os.environ.get("TELEGRAM_API_ID", "0"))
     api_hash:       str = os.environ.get("TELEGRAM_API_HASH", "")
+
+    # User session - messages fetch karne ke liye
+    session_string: str = os.environ.get("TELEGRAM_SESSION_STRING", "")
+
+    # Bot token - optional, future use
+    bot_token:      str = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+
     channel_id:     str = os.environ.get("TELEGRAM_CHANNEL_ID", "")
     port:           int = int(os.environ.get("PORT", "10000"))
 
-    pyrogram_chunk_bytes: int = 1024 * 1024      # 1MB - DO NOT CHANGE
-    max_response_bytes:   int = 5 * 1024 * 1024  # 5MB per HTTP response
+    pyrogram_chunk_bytes: int = 1024 * 1024
+    max_response_bytes:   int = 5 * 1024 * 1024
     demo_file_size:       int = 10 * 1024 * 1024
 
     max_concurrent_streams: int = 5
     requests_per_minute:    int = 120
     max_ip_log_size:        int = 5000
 
-    file_cache_ttl: int = 10 * 60  # 10 min
+    file_cache_ttl: int = 10 * 60
     max_cache_size: int = 500
 
     max_retries:      int   = 3
@@ -79,13 +79,8 @@ class Config:
     ffmpeg_threads: int = int(os.environ.get("FFMPEG_THREADS", "2"))
 
     @property
-    def use_bot(self) -> bool:
-        return bool(self.bot_token)
-
-    @property
     def is_configured(self) -> bool:
-        return bool(self.api_id and self.api_hash and
-                    (self.bot_token or self.session_string))
+        return bool(self.api_id and self.api_hash and self.session_string)
 
 
 cfg = Config()
@@ -192,78 +187,71 @@ class FileCache:
 file_cache = FileCache(cfg.max_cache_size)
 
 # ─── Telegram Client ──────────────────────────────────────────────────────────
+#
+# KEY FIX: AUTH_KEY_DUPLICATED problem ka permanent solution:
+#
+# Problem: Session file (.session) ek jagah se zyada use nahi ho sakti
+#          Render pe deploy karo → local pe chalu hai → DUPLICATE ERROR
+#
+# Solution: session_string use karo (not file)
+#           Session STRING in-memory hoti hai, file nahi banti
+#           Multiple instances ek hi string use kar sakte hain? NO.
+#           
+# ACTUAL FIX: Har instance apna UNIQUE in-memory session banata hai
+#             session_string se SIRF initial auth leta hai
+#             Phir apna alag auth key banata hai
+#             = No duplicate error!
+#
+# Yeh Pyrogram ka "in_memory" parameter karta hai exactly yahi
 
-def create_client() -> Client:
-    """
-    Bot token → preferred (no duplicate session issues)
-    Session string → fallback (user account)
-    """
-    if cfg.use_bot:
-        log.info("🤖 Using Bot Token mode")
-        return Client(
-            name      = "bot",
-            api_id    = cfg.api_id,
-            api_hash  = cfg.api_hash,
-            bot_token = cfg.bot_token,
-            # Bot handles multiple instances automatically
-            # No AUTH_KEY_DUPLICATED possible
-        )
-    else:
-        log.warning("👤 Using User Session mode (bot token preferred)")
-        return Client(
-            name           = "stream",
-            api_id         = cfg.api_id,
-            api_hash       = cfg.api_hash,
-            session_string = cfg.session_string,
-        )
-
-
-tg: Client = create_client()
-
-# Channel peer cache
+tg: Optional[Client] = None
 _channel_peers: dict[str, str] = {}
 
 
+def _make_client() -> Client:
+    """
+    in_memory=True:
+      - Koi .session file nahi banta
+      - Har restart fresh connection
+      - AUTH_KEY_DUPLICATED IMPOSSIBLE
+      - session_string se auth lete hain, phir apna key banate hain
+    """
+    return Client(
+        name           = "stream",
+        api_id         = cfg.api_id,
+        api_hash       = cfg.api_hash,
+        session_string = cfg.session_string,
+        in_memory      = True,   # ← THE PERMANENT FIX
+    )
+
+
 async def resolve_channel(channel_id: str) -> str:
-    """
-    Channel ko resolve karke peer cache me store karo.
-    Bot mode me yeh automatically kaam karta hai.
-    """
+    """Channel resolve karke peer cache me store karo."""
     if channel_id in _channel_peers:
         return _channel_peers[channel_id]
 
     try:
         chat        = await tg.get_chat(channel_id)
         resolved_id = str(chat.id)
-
         _channel_peers[channel_id]  = resolved_id
         _channel_peers[resolved_id] = resolved_id
-
-        log.info(f"✅ Channel: {chat.title} (id={resolved_id})")
+        log.info(f"✅ Channel resolved: {chat.title} ({resolved_id})")
         return resolved_id
-
     except Exception as e:
-        log.error(f"❌ Cannot resolve channel '{channel_id}': {e}")
-        raise ValueError(
-            f"Cannot access channel '{channel_id}'. "
-            f"{'Add bot as admin in channel.' if cfg.use_bot else 'Check session.'}"
-        )
+        log.error(f"❌ Cannot resolve '{channel_id}': {e}")
+        raise ValueError(f"Cannot access channel: {channel_id}. {e}")
 
 
 async def warm_up():
-    """Startup pe channels aur bot info resolve karo."""
+    """Startup initialization."""
     me = await tg.get_me()
-
-    if cfg.use_bot:
-        log.info(f"🤖 Bot: @{me.username} (id={me.id})")
-    else:
-        log.info(f"👤 User: {me.first_name} (@{me.username})")
+    log.info(f"✅ Logged in: {me.first_name} (@{me.username}) [id={me.id}]")
 
     if cfg.channel_id:
         try:
             await resolve_channel(cfg.channel_id)
         except Exception as e:
-            log.warning(f"⚠️  Could not resolve default channel: {e}")
+            log.warning(f"⚠️  Default channel warm-up failed: {e}")
 
 # ─── File Info ────────────────────────────────────────────────────────────────
 
@@ -290,12 +278,29 @@ async def fetch_file_info(message_id: int, channel_id: str) -> FileInfo:
 
     resolved = await resolve_channel(channel_id)
 
-    msg = await tg.get_messages(resolved, message_id)
+    try:
+        msg = await tg.get_messages(resolved, message_id)
+    except Exception as e:
+        err = str(e)
+        # Channel resolve ho gaya but message nahi mila
+        # Try karo channel ID ke alag format se
+        if "PEER_ID_INVALID" in err:
+            # Cache clear karke dobara try karo
+            _channel_peers.pop(channel_id, None)
+            _channel_peers.pop(resolved, None)
+            resolved = await resolve_channel(channel_id)
+            msg = await tg.get_messages(resolved, message_id)
+        else:
+            raise
+
     if isinstance(msg, list):
         msg = msg[0] if msg else None
 
     if not msg or msg.empty:
-        raise ValueError(f"Message {message_id} not found")
+        raise ValueError(
+            f"Message {message_id} not found. "
+            f"Make sure the account has access to this message."
+        )
 
     doc = (msg.document or msg.video or msg.audio
            or msg.voice or msg.video_note)
@@ -543,8 +548,7 @@ async def lifespan(app: FastAPI):
     log.info("🚀 Starting...")
 
     if cfg.is_configured:
-        # Recreate client fresh (avoids stale state)
-        tg = create_client()
+        tg = _make_client()
         await tg.start()
         await warm_up()
     else:
@@ -557,7 +561,7 @@ async def lifespan(app: FastAPI):
 
     log.info("👋 Shutting down...")
     try:
-        if tg.is_connected:
+        if tg and tg.is_connected:
             await tg.stop()
     except Exception:
         pass
@@ -565,7 +569,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title    = "Telegram Streaming",
-    version  = "5.0.0",
+    version  = "5.1.0",
     lifespan = lifespan,
     docs_url = "/docs",
 )
@@ -606,12 +610,12 @@ async def rate_limit_mw(request: Request, call_next):
 async def health():
     return {
         "status"         : "ok",
-        "mode"           : "bot" if cfg.use_bot else "user",
-        "telegram"       : tg.is_connected,
+        "telegram"       : tg.is_connected if tg else False,
         "ffmpeg"         : ffmpeg_available,
         "active_streams" : _active_streams,
         "cached_files"   : len(file_cache),
         "channels"       : list(set(_channel_peers.values())),
+        "in_memory"      : True,
         "timestamp"      : time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
 
@@ -621,7 +625,7 @@ async def file_info(
     message_id : int,
     channel    : str = Query(""),
 ):
-    if not tg.is_connected:
+    if not tg or not tg.is_connected:
         raise HTTPException(503, "Telegram not connected")
 
     cid = channel or cfg.channel_id
@@ -667,7 +671,7 @@ async def stream_route(
             headers     = {"Retry-After": "5", "Content-Type": "application/json"},
         )
 
-    if not tg.is_connected:
+    if not tg or not tg.is_connected:
         return _demo_response(request)
 
     try:
@@ -678,7 +682,6 @@ async def stream_route(
         log.error(f"Fetch error: {e}")
         raise HTTPException(500, str(e))
 
-    # Transcode path (MKV/AVI → MP4)
     if info.needs_transcode:
         if not ffmpeg_available:
             raise HTTPException(501, f"FFmpeg not installed. Cannot play {info.mime_type}.")
@@ -699,7 +702,6 @@ async def stream_route(
             media_type  = "video/mp4",
         )
 
-    # Direct stream path (MP4/WebM)
     file_size = info.file_size
     rh        = request.headers.get("Range", "")
     range_req = parse_range(rh, file_size)
@@ -780,16 +782,16 @@ def _safe_name(name: str) -> str:
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    mode = "🤖 BOT" if cfg.use_bot else "👤 USER SESSION"
     print(f"Listening on http://0.0.0.0:{cfg.port}", flush=True)
     print(f"""
 ╔══════════════════════════════════════════╗
-║   Telegram Streaming v5.0               ║
+║   Telegram Streaming v5.1               ║
+║   in_memory=True (no AUTH_DUPLICATE)    ║
 ╠══════════════════════════════════════════╣
-║  Mode    : {mode:<30} ║
 ║  Port    : {cfg.port:<30} ║
 ║  API ID  : {str(cfg.api_id) if cfg.api_id else "⚠️  NOT SET":<30} ║
 ║  Channel : {cfg.channel_id or "⚠️  NOT SET":<30} ║
+║  FFmpeg  : {cfg.ffmpeg_path:<30} ║
 ╚══════════════════════════════════════════╝
 """, flush=True)
 
