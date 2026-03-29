@@ -1,31 +1,13 @@
 """
 Telegram Video Streaming Service v4.0
-======================================
-FIXES:
-1. MKV/AVI/etc → FFmpeg real-time transcode to MP4 (HLS-ready)
-2. MP4 files → direct stream (no transcode needed)  
-3. Faster chunks (2MB response, 512KB pyrogram chunks)
-4. Proper MIME type detection
-5. FFmpeg subprocess with proper cleanup on disconnect
-
-HOW IT WORKS:
-  MKV/AVI → FFmpeg → pipe → browser (MP4 stream)
-  MP4     → Pyrogram → browser (direct stream)
-
-INSTALL FFMPEG:
-  Windows: https://ffmpeg.org/download.html → add to PATH
-  Linux:   apt install ffmpeg
-  Render:  add to render.yaml buildCommand
+Python 3.11 + Pyrogram + FFmpeg + FastAPI
 """
-
 from __future__ import annotations
 
 import asyncio
 import logging
 import os
 import re
-import subprocess
-import sys
 import time
 from collections import defaultdict
 from contextlib import asynccontextmanager
@@ -67,42 +49,36 @@ class Config:
     api_hash:       str   = os.environ.get("TELEGRAM_API_HASH", "")
     session_string: str   = os.environ.get("TELEGRAM_SESSION_STRING", "")
     channel_id:     str   = os.environ.get("TELEGRAM_CHANNEL_ID", "")
-    port:           int   = int(os.environ.get("PORT", "3031"))
 
-    # Pyrogram: offset=N means Nth 1MB chunk
+    # Render default port is 10000, fallback to 3031 for local
+    port: int = int(os.environ.get("PORT", "10000"))
+
     pyrogram_chunk_bytes: int = 1024 * 1024  # 1MB (DO NOT CHANGE)
+    max_response_bytes:   int = 5 * 1024 * 1024
+    demo_file_size:       int = 10 * 1024 * 1024
 
-    # Max bytes per HTTP response for direct streams
-    max_response_bytes: int = 5 * 1024 * 1024  # 5MB
-
-    # Demo
-    demo_file_size: int = 10 * 1024 * 1024
-
-    # Rate limits
-    max_concurrent_streams: int = 5   # less because transcode is heavy
+    max_concurrent_streams: int = 5
     requests_per_minute:    int = 120
     max_ip_log_size:        int = 5000
 
-    # Cache
     file_cache_ttl: int = 10 * 60
     max_cache_size: int = 500
 
-    # Retry
     max_retries:      int   = 3
     retry_base_delay: float = 1.0
 
-    # FFmpeg
     ffmpeg_path:    str = os.environ.get("FFMPEG_PATH", "ffmpeg")
     ffmpeg_threads: int = int(os.environ.get("FFMPEG_THREADS", "2"))
-    # Video quality: lower = faster transcode, less quality
     ffmpeg_crf:     int = int(os.environ.get("FFMPEG_CRF", "23"))
 
 
 cfg = Config()
 
+if not cfg.api_id or not cfg.api_hash:
+    log.warning("⚠️  Telegram not configured → demo mode only")
+
 # ─── MIME Helpers ─────────────────────────────────────────────────────────────
 
-# These can be streamed directly by browsers (no transcode needed)
 BROWSER_NATIVE_MIME = {
     "video/mp4",
     "video/webm",
@@ -113,7 +89,6 @@ BROWSER_NATIVE_MIME = {
     "audio/webm",
 }
 
-# Extension to MIME map
 MIME_EXT_MAP = {
     "x-matroska" : "mkv",
     "x-msvideo"  : "avi",
@@ -124,23 +99,22 @@ MIME_EXT_MAP = {
 }
 
 def needs_transcode(mime_type: str) -> bool:
-    """Returns True if browser cannot play this format natively."""
     return mime_type not in BROWSER_NATIVE_MIME
 
 # ─── Types ────────────────────────────────────────────────────────────────────
 
 @dataclass
 class FileInfo:
-    message_id:     int
-    channel_id:     str
-    file_id:        str
-    file_size:      int
-    mime_type:      str
-    file_name:      str
-    dc_id:          int
-    needs_transcode: bool = False
-    cached_at:      float = field(default_factory=time.time)
-    message:        Optional[Message] = field(default=None, repr=False)
+    message_id:      int
+    channel_id:      str
+    file_id:         str
+    file_size:       int
+    mime_type:       str
+    file_name:       str
+    dc_id:           int
+    needs_transcode: bool  = False
+    cached_at:       float = field(default_factory=time.time)
+    message:         Optional[Message] = field(default=None, repr=False)
 
     def is_fresh(self) -> bool:
         return time.time() - self.cached_at < cfg.file_cache_ttl
@@ -228,17 +202,13 @@ def _extract_filename(msg: Message, mime: str) -> str:
            or msg.voice or msg.video_note)
     if not doc:
         return f"media_{msg.id}.bin"
-
     if getattr(doc, "file_name", None):
         return doc.file_name
-
     ext_raw = mime.split("/")[-1].split(";")[0].strip()
     ext     = MIME_EXT_MAP.get(ext_raw, ext_raw)
-
     if msg.caption:
         safe = re.sub(r'[\\/*?:"<>|]', "_", msg.caption[:60]).strip()
         return f"{safe}.{ext}" if safe else f"media_{msg.id}.{ext}"
-
     return f"media_{msg.id}.{ext}"
 
 
@@ -280,10 +250,7 @@ async def fetch_file_info(message_id: int, channel_id: str) -> FileInfo:
 
     file_cache.set(info)
     mode = "🔄 transcode" if transcode else "✅ direct"
-    log.info(
-        f'📁 msg={message_id} | "{file_name}" | '
-        f'{fmt_bytes(file_size)} | {mime} | {mode}'
-    )
+    log.info(f'📁 msg={message_id} | "{file_name}" | {fmt_bytes(file_size)} | {mime} | {mode}')
     return info
 
 
@@ -292,28 +259,24 @@ async def refresh_file_info(info: FileInfo) -> FileInfo:
     file_cache.invalidate(info.cache_key())
     return await fetch_file_info(info.message_id, info.channel_id)
 
-# ─── Active Streams Counter ───────────────────────────────────────────────────
+# ─── Active Streams ───────────────────────────────────────────────────────────
 
 _active_streams = 0
 
-# ─── Direct Stream (MP4/WebM - no transcode) ──────────────────────────────────
+# ─── Direct Stream ────────────────────────────────────────────────────────────
 
 async def stream_direct(
     info:      FileInfo,
     range_req: RangeReq,
     request:   Request,
 ) -> AsyncGenerator[bytes, None]:
-    """
-    Direct stream for browser-compatible formats (MP4, WebM).
-    Uses pyrogram stream_media with chunk index.
-    """
     global _active_streams
     _active_streams += 1
 
-    CHUNK        = cfg.pyrogram_chunk_bytes  # 1MB
-    bytes_sent   = 0
-    total        = range_req.length
-    retries      = 0
+    CHUNK      = cfg.pyrogram_chunk_bytes
+    bytes_sent = 0
+    total      = range_req.length
+    retries    = 0
 
     log.info(
         f"🌊 Direct | msg={info.message_id} | "
@@ -339,12 +302,10 @@ async def stream_direct(
                     if await request.is_disconnected():
                         return
 
-                    # Skip bytes before range start in first chunk
                     if skip_bytes > 0:
                         raw_chunk  = raw_chunk[skip_bytes:]
                         skip_bytes = 0
 
-                    # Don't send more than requested
                     remaining = total - bytes_sent
                     if len(raw_chunk) > remaining:
                         raw_chunk = raw_chunk[:remaining]
@@ -382,65 +343,33 @@ async def stream_direct(
     finally:
         _active_streams -= 1
 
-
-# ─── Transcode Stream (MKV/AVI → MP4 via FFmpeg) ──────────────────────────────
+# ─── Transcode Stream ─────────────────────────────────────────────────────────
 
 async def stream_transcode(
     info:    FileInfo,
     request: Request,
 ) -> AsyncGenerator[bytes, None]:
-    """
-    Transcode non-browser-compatible formats to MP4 on-the-fly using FFmpeg.
-
-    Flow:
-    Pyrogram → stdin pipe → FFmpeg → stdout pipe → browser
-
-    FFmpeg settings:
-    - copy video if already H264 (fast, no quality loss)
-    - convert audio to AAC (browser compatible)
-    - output MP4 in streaming mode (frag_keyframe+empty_moov)
-    - movflags faststart equivalent for streaming
-    """
     global _active_streams
     _active_streams += 1
 
-    log.info(
-        f"🔄 Transcode | msg={info.message_id} | "
-        f'"{info.file_name}" | {info.mime_type} → video/mp4'
-    )
-
-    # FFmpeg command
-    # -i pipe:0          → read input from stdin
-    # -c:v copy          → copy video stream if H264 (no re-encode)
-    # -c:v libx264       → re-encode if needed (hevc/vp9/etc)
-    # -c:a aac           → convert audio to AAC (browser compatible)
-    # -movflags frag_keyframe+empty_moov+default_base_moof
-    #                    → fragmented MP4 for streaming (no seeking table needed)
-    # -f mp4             → output format MP4
-    # pipe:1             → write output to stdout
+    log.info(f"🔄 Transcode | msg={info.message_id} | {info.mime_type} → mp4")
 
     ffmpeg_cmd = [
         cfg.ffmpeg_path,
         "-hide_banner",
-        "-loglevel", "error",          # suppress ffmpeg logs
+        "-loglevel", "error",
         "-threads", str(cfg.ffmpeg_threads),
-        "-i", "pipe:0",                # input from stdin
-        # Video: try copy first, fallback handled by ffmpeg
-        "-c:v", "copy",                # copy H264 as-is
-        # If source is HEVC/VP9, uncomment below and comment above:
-        # "-c:v", "libx264",
-        # "-preset", "ultrafast",      # fastest encode
-        # "-crf", str(cfg.ffmpeg_crf),
-        "-c:a", "aac",                 # audio → AAC
+        "-i", "pipe:0",
+        "-c:v", "copy",
+        "-c:a", "aac",
         "-b:a", "128k",
         "-movflags", "frag_keyframe+empty_moov+default_base_moof",
         "-f", "mp4",
-        "pipe:1",                      # output to stdout
+        "pipe:1",
     ]
 
     proc = None
     try:
-        # Start FFmpeg process
         proc = await asyncio.create_subprocess_exec(
             *ffmpeg_cmd,
             stdin  = asyncio.subprocess.PIPE,
@@ -449,7 +378,6 @@ async def stream_transcode(
         )
 
         async def feed_ffmpeg():
-            """Feed Telegram data into FFmpeg stdin."""
             try:
                 async for raw_chunk in tg.stream_media(info.message, offset=0):
                     if proc.returncode is not None:
@@ -469,24 +397,19 @@ async def stream_transcode(
                     except Exception:
                         pass
 
-        # Start feeding in background
         feed_task = asyncio.create_task(feed_ffmpeg())
-
-        # Read FFmpeg output and send to browser
         bytes_sent = 0
+
         try:
             while True:
                 if await request.is_disconnected():
                     log.info("  🛑 Client disconnected")
                     break
-
-                chunk = await proc.stdout.read(65536)  # 64KB output chunks
+                chunk = await proc.stdout.read(65536)
                 if not chunk:
                     break
-
                 yield chunk
                 bytes_sent += len(chunk)
-
         finally:
             feed_task.cancel()
             try:
@@ -499,9 +422,7 @@ async def stream_transcode(
     except Exception as e:
         log.error(f"  ❌ Transcode error: {e}")
         raise
-
     finally:
-        # Kill FFmpeg if still running
         if proc and proc.returncode is None:
             try:
                 proc.kill()
@@ -513,7 +434,6 @@ async def stream_transcode(
 # ─── FFmpeg Check ─────────────────────────────────────────────────────────────
 
 async def check_ffmpeg() -> bool:
-    """Check if FFmpeg is available."""
     try:
         proc = await asyncio.create_subprocess_exec(
             cfg.ffmpeg_path, "-version",
@@ -533,9 +453,7 @@ def parse_range(header: str, file_size: int) -> Optional[RangeReq]:
     m = re.match(r"bytes=(\d*)-(\d*)", header)
     if not m:
         return None
-
     s, e = m.group(1), m.group(2)
-
     if s == "" and e != "":
         suffix = int(e)
         start  = max(0, file_size - suffix)
@@ -545,14 +463,12 @@ def parse_range(header: str, file_size: int) -> Optional[RangeReq]:
         end   = int(e) if e else file_size - 1
     else:
         return None
-
     end = min(end, file_size - 1)
     if start < 0 or start >= file_size or start > end:
         return None
-
     return RangeReq(start=start, end=end)
 
-# ─── App ──────────────────────────────────────────────────────────────────────
+# ─── FastAPI App ──────────────────────────────────────────────────────────────
 
 ffmpeg_available = False
 
@@ -560,23 +476,20 @@ ffmpeg_available = False
 async def lifespan(app: FastAPI):
     global ffmpeg_available
 
-    log.info("🚀 Starting...")
+    log.info("🚀 Starting Telegram client...")
 
     if cfg.api_id and cfg.api_hash and cfg.session_string:
         await tg.start()
         me = await tg.get_me()
         log.info(f"✅ Telegram: {me.first_name} (@{me.username})")
     else:
-        log.warning("⚠️  Telegram not configured")
+        log.warning("⚠️  Telegram not configured → demo mode")
 
     ffmpeg_available = await check_ffmpeg()
     if ffmpeg_available:
-        log.info("✅ FFmpeg available → MKV/AVI transcoding enabled")
+        log.info(f"✅ FFmpeg ready → {cfg.ffmpeg_path}")
     else:
-        log.warning(
-            "⚠️  FFmpeg not found → MKV/AVI files will NOT play\n"
-            "   Install: apt install ffmpeg  OR  set FFMPEG_PATH env var"
-        )
+        log.warning(f"⚠️  FFmpeg not found at '{cfg.ffmpeg_path}'")
 
     yield
 
@@ -586,7 +499,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title     = "Telegram Streaming v4",
+    title     = "Telegram Streaming",
     version   = "4.0.0",
     lifespan  = lifespan,
     docs_url  = "/docs",
@@ -605,7 +518,7 @@ app.add_middleware(
     max_age = 86400,
 )
 
-# ─── Middleware ───────────────────────────────────────────────────────────────
+# ─── Rate Limit Middleware ────────────────────────────────────────────────────
 
 SKIP_RL = {"/health", "/docs", "/openapi.json"}
 
@@ -631,17 +544,13 @@ async def rate_limit_mw(request: Request, call_next):
 @app.get("/health")
 async def health():
     return {
-        "status"          : "ok",
-        "telegram"        : tg.is_connected,
-        "ffmpeg"          : ffmpeg_available,
-        "active_streams"  : _active_streams,
-        "cached_files"    : len(file_cache),
-        "config"          : {
-            "max_concurrent"      : cfg.max_concurrent_streams,
-            "requests_per_minute" : cfg.requests_per_minute,
-            "max_response_size"   : fmt_bytes(cfg.max_response_bytes),
-        },
-        "timestamp" : time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "status"         : "ok",
+        "telegram"       : tg.is_connected,
+        "ffmpeg"         : ffmpeg_available,
+        "active_streams" : _active_streams,
+        "cached_files"   : len(file_cache),
+        "port"           : cfg.port,
+        "timestamp"      : time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
 
 
@@ -664,7 +573,6 @@ async def file_info(
     except Exception as e:
         raise HTTPException(500, str(e))
 
-    # Effective MIME type (transcode changes it to mp4)
     effective_mime = "video/mp4" if info.needs_transcode else info.mime_type
 
     return {
@@ -694,7 +602,7 @@ async def stream(
 
     if _active_streams >= cfg.max_concurrent_streams:
         return Response(
-            '{"error":"Too many streams. Try again."}',
+            '{"error":"Too many streams"}',
             status_code = 429,
             headers     = {"Retry-After": "5", "Content-Type": "application/json"},
         )
@@ -710,36 +618,35 @@ async def stream(
         log.error(f"Fetch error: {e}")
         raise HTTPException(500, str(e))
 
-    # ── Transcode path (MKV, AVI, etc.) ──────────────────────────────────────
+    # ── Transcode (MKV/AVI → MP4) ─────────────────────────────────────────────
     if info.needs_transcode:
         if not ffmpeg_available:
             raise HTTPException(
                 501,
-                f"FFmpeg not installed. Cannot stream {info.mime_type} files. "
-                "Install FFmpeg on the server."
+                f"FFmpeg not installed. Cannot play {info.mime_type}. "
+                "Install FFmpeg on server."
             )
 
         log.info(f'\n🎬 TRANSCODE | msg={message_id} | "{info.file_name}"')
 
         headers = {
             "Content-Type"        : "video/mp4",
-            "Accept-Ranges"       : "none",  # no seeking for transcoded streams
+            "Accept-Ranges"       : "none",
             "Content-Disposition" : f'inline; filename="{_safe_name(info.file_name)}.mp4"',
             "Cache-Control"       : "no-cache, no-store",
-            "X-Original-Mime"     : info.mime_type,
         }
 
         if request.method == "HEAD":
             return Response(status_code=200, headers=headers)
 
         return StreamingResponse(
-            content    = stream_transcode(info, request),
+            content     = stream_transcode(info, request),
             status_code = 200,
-            headers    = headers,
-            media_type = "video/mp4",
+            headers     = headers,
+            media_type  = "video/mp4",
         )
 
-    # ── Direct stream path (MP4, WebM) ────────────────────────────────────────
+    # ── Direct stream (MP4/WebM) ──────────────────────────────────────────────
     file_size = info.file_size
     rh        = request.headers.get("Range", "")
     range_req = parse_range(rh, file_size)
@@ -820,25 +727,20 @@ def _safe_name(name: str) -> str:
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    # Print port FIRST so Render detects open port immediately
+    print(f"Listening on http://0.0.0.0:{cfg.port}", flush=True)
     print(f"""
 ╔══════════════════════════════════════════╗
 ║   Telegram Video Streaming v4.0         ║
-║   Python + Pyrogram + FFmpeg + FastAPI  ║
 ╠══════════════════════════════════════════╣
-║  Port        : {cfg.port:<26} ║
-║  API ID      : {str(cfg.api_id) if cfg.api_id else "⚠️  NOT SET":<26} ║
-║  Channel     : {cfg.channel_id or "pass ?channel=...":<26} ║
-║  FFmpeg      : {cfg.ffmpeg_path:<26} ║
-╠══════════════════════════════════════════╣
-║  MP4/WebM → Direct stream (fast)        ║
-║  MKV/AVI  → FFmpeg transcode (compat)   ║
+║  Port    : {cfg.port:<30} ║
+║  API ID  : {str(cfg.api_id) if cfg.api_id else "⚠️  NOT SET":<30} ║
+║  FFmpeg  : {cfg.ffmpeg_path:<30} ║
 ╠══════════════════════════════════════════╣
 ║  GET /stream/{{id}}?channel=ID            ║
 ║  GET /info/{{id}}?channel=ID              ║
 ║  GET /health                             ║
-║  GET /docs                               ║
 ╚══════════════════════════════════════════╝
-Listening on http://0.0.0.0:{cfg.port}
 """, flush=True)
 
     uvicorn.run(

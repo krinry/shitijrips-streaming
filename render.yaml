@@ -2,14 +2,15 @@ services:
   - type: web
     name: streaming-service
     runtime: python
-    pythonVersion: "3.11.9"
     buildCommand: "chmod +x build.sh && ./build.sh"
     startCommand: "python main.py"
     envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.9"
       - key: PORT
-        value: 3030
+        value: "10000"
       - key: FFMPEG_PATH
-        value: ./bin/ffmpeg
+        value: "./bin/ffmpeg"
       - key: TELEGRAM_API_ID
         sync: false
       - key: TELEGRAM_API_HASH
