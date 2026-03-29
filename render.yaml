@@ -1,12 +1,14 @@
-# render.yaml
 services:
   - type: web
     name: streaming-service
-    env: python
+    runtime: python
     buildCommand: pip install -r requirements.txt
     startCommand: python main.py
-    plan: free
     envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: PORT
+        value: 3030
       - key: TELEGRAM_API_ID
         sync: false
       - key: TELEGRAM_API_HASH
@@ -15,5 +17,3 @@ services:
         sync: false
       - key: TELEGRAM_CHANNEL_ID
         sync: false
-      - key: PORT
-        value: "3030"
