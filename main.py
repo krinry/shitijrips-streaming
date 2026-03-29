@@ -351,47 +351,45 @@ async def stream_file(
                 # Align offset to 4096 bytes (Telegram requirement)
                 aligned_offset = (current_offset // 4096) * 4096
 
-                # Calculate limit - must be at least 4096 for Telegram
-                # but also should respect what the browser actually needs
-                if aligned_offset > current_offset:
-                    # We're aligning back, so we need extra bytes
-                    adjusted_offset = aligned_offset
-                    adjusted_limit = current_offset - aligned_offset + remaining
-                else:
-                    adjusted_offset = current_offset
-                    adjusted_limit = remaining
+                # Calculate how much extra data we need to fetch due to alignment
+                extra_before = current_offset - aligned_offset  # bytes before our actual start
 
-                # Ensure limit is at least 4096 (Telegram minimum)
-                # But cap at 512KB to avoid getting too much data
-                if adjusted_limit < 4096:
-                    adjusted_limit = 4096
-                elif adjusted_limit > 512 * 1024:
-                    adjusted_limit = 512 * 1024
+                # Calculate limit - we need remaining bytes plus alignment overhead
+                # But Telegram requires minimum 4096 bytes limit
+                required_limit = remaining + extra_before
+                if required_limit < 4096:
+                    required_limit = 4096  # Telegram minimum
+                elif required_limit > 512 * 1024:
+                    required_limit = 512 * 1024  # Cap at 512KB
 
-                log.info(f"  📥 Fetching | offset={fmt_bytes(adjusted_offset)} | limit={fmt_bytes(adjusted_limit)}")
+                log.info(f"  📥 Fetching | actual_offset={fmt_bytes(aligned_offset)} | limit={fmt_bytes(required_limit)} | need={fmt_bytes(remaining)}")
 
                 async for chunk in tg.stream_media(
                     info.message,
-                    offset = adjusted_offset,
-                    limit  = adjusted_limit,
+                    offset = aligned_offset,
+                    limit  = required_limit,
                 ):
                     if await request.is_disconnected():
                         log.info("  🛑 Disconnected mid-stream")
                         return
 
-                    # Calculate how much of this chunk we actually need to send
-                    chunk_offset = adjusted_offset
-                    chunk_end = adjusted_offset + len(chunk)
+                    # Calculate where this chunk starts in the file
+                    chunk_start = aligned_offset
+                    chunk_length = len(chunk)
 
-                    # Skip bytes before our actual start
-                    if chunk_offset < range_req.start:
-                        skip = range_req.start - chunk_offset
+                    # Skip bytes before our actual start (due to alignment)
+                    if chunk_start < range_req.start:
+                        skip = range_req.start - chunk_start
+                        if skip >= chunk_length:
+                            # This entire chunk is before our range, skip it
+                            aligned_offset += chunk_length
+                            continue
                         chunk = chunk[skip:]
-                        chunk_offset = range_req.start
+                        chunk_start = range_req.start
 
-                    # Don't send bytes beyond our range end
-                    if chunk_offset + len(chunk) > range_req.end + 1:
-                        keep = (range_req.end + 1) - chunk_offset
+                    # Trim bytes after our range end
+                    if chunk_start + len(chunk) > range_req.end + 1:
+                        keep = (range_req.end + 1) - chunk_start
                         if keep > 0:
                             chunk = chunk[:keep]
                         else:
@@ -400,6 +398,9 @@ async def stream_file(
                     if chunk:
                         yield chunk
                         bytes_sent += len(chunk)
+
+                    # Update aligned_offset for next iteration
+                    aligned_offset += chunk_length
 
                     if bytes_sent >= total:
                         break
@@ -428,7 +429,7 @@ async def stream_file(
                         raise
                     retries += 1
                     bytes_sent = 0
-                    log.warning(f"⚠️  Offset/limit error, retrying (attempt {retries})")
+                    log.warning(f"⚠️  Offset/limit error, retrying from start (attempt {retries})")
                     await asyncio.sleep(1)
                     continue
                 if retries >= cfg.max_retries:
@@ -697,16 +698,15 @@ async def stream_video(
         # No Range header → start from beginning
         range_req = RangeRequest(start=0, end=file_size - 1)
 
+    # If range end is before start (invalid range from browser), start from beginning
+    if range_req.end < range_req.start:
+        log.warning(f"⚠️  Invalid range {range_req.start}-{range_req.end}, serving from start")
+        range_req = RangeRequest(start=0, end=min(cfg.max_response_bytes, file_size) - 1)
+
     # Validate range - offset must be < file_size
     if range_req.start >= file_size:
-        return Response(
-            status_code = 416,
-            headers     = {
-                "Content-Range"              : f"bytes */{file_size}",
-                "Content-Length"             : "0",
-                "Access-Control-Allow-Origin": "*",
-            },
-        )
+        log.warning(f"⚠️  Range start {range_req.start} >= file size {file_size}, serving from start")
+        range_req = RangeRequest(start=0, end=min(cfg.max_response_bytes, file_size) - 1)
 
     # Cap response size so browser gets data fast and seeks work immediately
     capped_end   = min(range_req.end, file_size - 1)
