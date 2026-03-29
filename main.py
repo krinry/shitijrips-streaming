@@ -534,12 +534,26 @@ async def file_info(
     channel    : str = Query(default="", description="Channel ID or username"),
 ):
     """Get file metadata without streaming."""
-    if not tg.is_connected:
+    try:
+        if not tg.is_connected:
+            raise HTTPException(503, "Telegram not configured")
+    except Exception:
         raise HTTPException(503, "Telegram not configured")
 
     channel_id = channel or cfg.channel_id
     if not channel_id:
         raise HTTPException(400, "Missing channel ID. Pass ?channel=... or set TELEGRAM_CHANNEL_ID")
+
+    # Normalize channel_id
+    if channel_id.startswith("@"):
+        channel_id = channel_id[1:]
+    elif not channel_id.startswith("-100") and not channel_id.startswith("-"):
+        try:
+            chat = await tg.get_chat(channel_id)
+            channel_id = str(chat.id)
+        except Exception as e:
+            log.warning(f"Could not resolve username {channel_id}: {e}")
+            raise HTTPException(400, f"Invalid channel ID: {channel_id}")
 
     try:
         info = await fetch_file_info(message_id, channel_id)
@@ -580,6 +594,21 @@ async def stream_video(
 
     if not channel_id:
         raise HTTPException(400, "Missing channel ID")
+
+    # Normalize channel_id format
+    # Remove @ prefix if present, ensure it starts with - for private channels
+    if channel_id.startswith("@"):
+        channel_id = channel_id[1:]
+    elif not channel_id.startswith("-100") and not channel_id.startswith("-"):
+        # Try to look up username - this will establish the peer
+        try:
+            chat = await tg.get_chat(channel_id)
+            # Use the numeric ID format
+            channel_id = str(chat.id)
+            log.info(f"Resolved channel @{channel_id} -> {channel_id}")
+        except Exception as e:
+            log.warning(f"Could not resolve username {channel_id}: {e}")
+            raise HTTPException(400, f"Invalid channel ID: {channel_id}")
 
     # Concurrent stream limit
     if _active_streams >= cfg.max_concurrent_streams:
