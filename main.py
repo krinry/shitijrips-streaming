@@ -346,24 +346,19 @@ async def stream_file(
                 return
 
             try:
-                # Pyrogram stream_media():
-                # - offset: start byte position
-                # - limit:  max bytes to stream
-                # Pyrogram handles chunking internally with correct sizes
+                # Use smaller aligned chunks for Telegram API
+                # Telegram requires offset to be multiple of 4096 bytes
+                chunk_size = min(512 * 1024, total - bytes_sent)  # 512KB chunks
+                
                 async for chunk in tg.stream_media(
                     info.message,
                     offset   = range_req.start + bytes_sent,
-                    limit    = total - bytes_sent,
+                    limit    = chunk_size,
                 ):
                     # Check disconnect inside chunk loop too
                     if await request.is_disconnected():
                         log.info("  🛑 Disconnected mid-stream")
                         return
-
-                    # Trim if pyrogram gives more than needed
-                    remaining = total - bytes_sent
-                    if len(chunk) > remaining:
-                        chunk = chunk[:remaining]
 
                     yield chunk
                     bytes_sent += len(chunk)
@@ -388,6 +383,18 @@ async def stream_file(
                 await asyncio.sleep(wait)
 
             except RPCError as e:
+                err_str = str(e)
+                # OFFSET_INVALID - try with smaller aligned offset
+                if "OFFSET_INVALID" in err_str or "LIMIT_INVALID" in err_str:
+                    if retries >= cfg.max_retries:
+                        log.error(f"❌ Offset/limit error after {retries} retries: {e}")
+                        raise
+                    retries += 1
+                    # Reset bytes_sent to retry from start of range
+                    bytes_sent = 0
+                    log.warning(f"⚠️  Offset/limit error, retrying (attempt {retries})")
+                    await asyncio.sleep(1)
+                    continue
                 if retries >= cfg.max_retries:
                     raise
                 retries += 1
@@ -654,8 +661,19 @@ async def stream_video(
         # No Range header → start from beginning
         range_req = RangeRequest(start=0, end=file_size - 1)
 
+    # Validate range - offset must be < file_size
+    if range_req.start >= file_size:
+        return Response(
+            status_code = 416,
+            headers     = {
+                "Content-Range"              : f"bytes */{file_size}",
+                "Content-Length"             : "0",
+                "Access-Control-Allow-Origin": "*",
+            },
+        )
+
     # Cap response size so browser gets data fast and seeks work immediately
-    capped_end   = min(range_req.end, range_req.start + cfg.max_response_bytes - 1)
+    capped_end   = min(range_req.end, file_size - 1)
     capped_range = RangeRequest(start=range_req.start, end=capped_end)
     content_len  = capped_range.length
 
