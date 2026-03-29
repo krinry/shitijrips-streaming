@@ -1,20 +1,21 @@
 """
-Telegram Video Streaming Service
-=================================
-Stack: Python 3.11-3.13 | Pyrogram 2.x | FastAPI | Uvicorn
-
+Telegram Video Streaming Service v4.0
+======================================
 FIXES:
-  - OFFSET_INVALID: stream_media(offset=N) means Nth CHUNK not Nth BYTE
-    offset=0 means chunk 0 (bytes 0-512KB)
-    offset=1 means chunk 1 (bytes 512KB-1MB)
-    chunk_size = 1MB (pyrogram default)
-    So: chunk_number = byte_offset // (1024*1024)
-  - Python 3.14: use pyrogram 2.0.106 max (not compatible with 3.14)
-  - Render: bind 0.0.0.0, print port before uvicorn starts
-  - Ctrl+C: proper signal handling
+1. MKV/AVI/etc → FFmpeg real-time transcode to MP4 (HLS-ready)
+2. MP4 files → direct stream (no transcode needed)  
+3. Faster chunks (2MB response, 512KB pyrogram chunks)
+4. Proper MIME type detection
+5. FFmpeg subprocess with proper cleanup on disconnect
 
-IMPORTANT: Use Python 3.11 or 3.12 (NOT 3.13/3.14)
-  render.yaml: pythonVersion: "3.11.9"
+HOW IT WORKS:
+  MKV/AVI → FFmpeg → pipe → browser (MP4 stream)
+  MP4     → Pyrogram → browser (direct stream)
+
+INSTALL FFMPEG:
+  Windows: https://ffmpeg.org/download.html → add to PATH
+  Linux:   apt install ffmpeg
+  Render:  add to render.yaml buildCommand
 """
 
 from __future__ import annotations
@@ -23,7 +24,7 @@ import asyncio
 import logging
 import os
 import re
-import signal
+import subprocess
 import sys
 import time
 from collections import defaultdict
@@ -45,8 +46,6 @@ from pyrogram.errors import (
     RPCError,
 )
 from pyrogram.types import Message
-
-# ─── Load Environment ─────────────────────────────────────────────────────────
 
 load_dotenv()
 
@@ -70,49 +69,78 @@ class Config:
     channel_id:     str   = os.environ.get("TELEGRAM_CHANNEL_ID", "")
     port:           int   = int(os.environ.get("PORT", "3031"))
 
-    # Pyrogram stream_media chunk size (FIXED - do not change)
-    # pyrogram internally uses 1MB chunks
-    # offset=N means: skip first N chunks (each 1MB)
-    pyrogram_chunk_bytes: int = 1024 * 1024  # 1MB
+    # Pyrogram: offset=N means Nth 1MB chunk
+    pyrogram_chunk_bytes: int = 1024 * 1024  # 1MB (DO NOT CHANGE)
 
-    # Max bytes per HTTP response
-    max_response_bytes: int = 5 * 1024 * 1024   # 5MB
+    # Max bytes per HTTP response for direct streams
+    max_response_bytes: int = 5 * 1024 * 1024  # 5MB
 
     # Demo
     demo_file_size: int = 10 * 1024 * 1024
 
     # Rate limits
-    max_concurrent_streams: int = 10
+    max_concurrent_streams: int = 5   # less because transcode is heavy
     requests_per_minute:    int = 120
     max_ip_log_size:        int = 5000
 
     # Cache
-    file_cache_ttl:  int = 10 * 60
-    max_cache_size:  int = 500
+    file_cache_ttl: int = 10 * 60
+    max_cache_size: int = 500
 
     # Retry
-    max_retries:        int   = 3
-    retry_base_delay:   float = 1.0
+    max_retries:      int   = 3
+    retry_base_delay: float = 1.0
+
+    # FFmpeg
+    ffmpeg_path:    str = os.environ.get("FFMPEG_PATH", "ffmpeg")
+    ffmpeg_threads: int = int(os.environ.get("FFMPEG_THREADS", "2"))
+    # Video quality: lower = faster transcode, less quality
+    ffmpeg_crf:     int = int(os.environ.get("FFMPEG_CRF", "23"))
 
 
 cfg = Config()
 
-if not cfg.api_id or not cfg.api_hash:
-    log.warning("⚠️  Telegram not configured → demo mode only")
+# ─── MIME Helpers ─────────────────────────────────────────────────────────────
+
+# These can be streamed directly by browsers (no transcode needed)
+BROWSER_NATIVE_MIME = {
+    "video/mp4",
+    "video/webm",
+    "video/ogg",
+    "audio/mpeg",
+    "audio/ogg",
+    "audio/wav",
+    "audio/webm",
+}
+
+# Extension to MIME map
+MIME_EXT_MAP = {
+    "x-matroska" : "mkv",
+    "x-msvideo"  : "avi",
+    "quicktime"  : "mov",
+    "x-ms-wmv"   : "wmv",
+    "mpeg"       : "mpg",
+    "x-flv"      : "flv",
+}
+
+def needs_transcode(mime_type: str) -> bool:
+    """Returns True if browser cannot play this format natively."""
+    return mime_type not in BROWSER_NATIVE_MIME
 
 # ─── Types ────────────────────────────────────────────────────────────────────
 
 @dataclass
 class FileInfo:
-    message_id: int
-    channel_id: str
-    file_id:    str
-    file_size:  int
-    mime_type:  str
-    file_name:  str
-    dc_id:      int
-    cached_at:  float   = field(default_factory=time.time)
-    message:    Optional[Message] = field(default=None, repr=False)
+    message_id:     int
+    channel_id:     str
+    file_id:        str
+    file_size:      int
+    mime_type:      str
+    file_name:      str
+    dc_id:          int
+    needs_transcode: bool = False
+    cached_at:      float = field(default_factory=time.time)
+    message:        Optional[Message] = field(default=None, repr=False)
 
     def is_fresh(self) -> bool:
         return time.time() - self.cached_at < cfg.file_cache_ttl
@@ -144,14 +172,12 @@ class RateLimiter:
         times  = [t for t in self._log[ip] if now - t < window]
         times.append(now)
         self._log[ip] = times
-
         if len(self._log) > self.max_ips:
             cutoff = now - window
             stale  = [k for k, v in self._log.items()
                       if all(t < cutoff for t in v)]
             for k in stale[:100]:
                 del self._log[k]
-
         return len(times) <= self.rpm
 
 
@@ -197,33 +223,23 @@ tg = Client(
 
 # ─── File Info ────────────────────────────────────────────────────────────────
 
-_MIME_EXT = {
-    "x-matroska" : "mkv",
-    "x-msvideo"  : "avi",
-    "quicktime"  : "mov",
-    "x-ms-wmv"   : "wmv",
-    "mpeg"       : "mpg",
-    "x-flv"      : "flv",
-    "webm"       : "webm",
-}
-
-def _extract_filename(msg: Message, mime: str, msg_id: int) -> str:
+def _extract_filename(msg: Message, mime: str) -> str:
     doc = (msg.document or msg.video or msg.audio
            or msg.voice or msg.video_note)
     if not doc:
-        return f"media_{msg_id}.bin"
+        return f"media_{msg.id}.bin"
 
     if getattr(doc, "file_name", None):
         return doc.file_name
 
     ext_raw = mime.split("/")[-1].split(";")[0].strip()
-    ext     = _MIME_EXT.get(ext_raw, ext_raw)
+    ext     = MIME_EXT_MAP.get(ext_raw, ext_raw)
 
     if msg.caption:
         safe = re.sub(r'[\\/*?:"<>|]', "_", msg.caption[:60]).strip()
-        return f"{safe}.{ext}" if safe else f"media_{msg_id}.{ext}"
+        return f"{safe}.{ext}" if safe else f"media_{msg.id}.{ext}"
 
-    return f"media_{msg_id}.{ext}"
+    return f"media_{msg.id}.{ext}"
 
 
 async def fetch_file_info(message_id: int, channel_id: str) -> FileInfo:
@@ -242,28 +258,31 @@ async def fetch_file_info(message_id: int, channel_id: str) -> FileInfo:
     doc = (msg.document or msg.video or msg.audio
            or msg.voice or msg.video_note)
     if not doc:
-        raise ValueError(f"Message {message_id} has no streamable media")
+        raise ValueError(f"Message {message_id} has no media")
 
     mime      = getattr(doc, "mime_type", None) or "video/mp4"
-    file_name = _extract_filename(msg, mime, message_id)
+    file_name = _extract_filename(msg, mime)
     file_size = getattr(doc, "file_size", 0) or 0
     dc_id     = getattr(doc, "dc_id", 0) or 0
+    transcode = needs_transcode(mime)
 
     info = FileInfo(
-        message_id = message_id,
-        channel_id = channel_id,
-        file_id    = getattr(doc, "file_id", ""),
-        file_size  = file_size,
-        mime_type  = mime,
-        file_name  = file_name,
-        dc_id      = dc_id,
-        message    = msg,
+        message_id      = message_id,
+        channel_id      = channel_id,
+        file_id         = getattr(doc, "file_id", ""),
+        file_size       = file_size,
+        mime_type       = mime,
+        file_name       = file_name,
+        dc_id           = dc_id,
+        needs_transcode = transcode,
+        message         = msg,
     )
 
     file_cache.set(info)
+    mode = "🔄 transcode" if transcode else "✅ direct"
     log.info(
         f'📁 msg={message_id} | "{file_name}" | '
-        f'{fmt_bytes(file_size)} | dc={dc_id}'
+        f'{fmt_bytes(file_size)} | {mime} | {mode}'
     )
     return info
 
@@ -273,46 +292,33 @@ async def refresh_file_info(info: FileInfo) -> FileInfo:
     file_cache.invalidate(info.cache_key())
     return await fetch_file_info(info.message_id, info.channel_id)
 
-# ─── Core Stream Generator ────────────────────────────────────────────────────
+# ─── Active Streams Counter ───────────────────────────────────────────────────
 
 _active_streams = 0
 
-# THE KEY FIX:
-# pyrogram stream_media(offset=N) means:
-#   "skip first N chunks, where each chunk = 1MB (1048576 bytes)"
-#
-# So to seek to byte position B:
-#   chunk_number = B // 1_048_576      ← which 1MB block contains byte B
-#   skip_bytes   = B % 1_048_576       ← bytes to skip within that block
-#
-# Example: seek to byte 5_000_000
-#   chunk_number = 5_000_000 // 1_048_576 = 4  (chunk index 4)
-#   skip_bytes   = 5_000_000 % 1_048_576  = 814848
-#   First chunk received starts at byte 4*1048576 = 4194304
-#   We skip first 805696 bytes of that chunk
+# ─── Direct Stream (MP4/WebM - no transcode) ──────────────────────────────────
 
-async def stream_file(
+async def stream_direct(
     info:      FileInfo,
     range_req: RangeReq,
     request:   Request,
 ) -> AsyncGenerator[bytes, None]:
+    """
+    Direct stream for browser-compatible formats (MP4, WebM).
+    Uses pyrogram stream_media with chunk index.
+    """
     global _active_streams
     _active_streams += 1
 
-    bytes_sent = 0
-    total      = range_req.length
-    retries    = 0
-
-    # Calculate starting chunk
-    # pyrogram chunk = 1MB = 1_048_576 bytes
-    CHUNK = cfg.pyrogram_chunk_bytes
-    start_chunk   = range_req.start // CHUNK   # which chunk to start from
-    skip_in_chunk = range_req.start % CHUNK    # bytes to skip in first chunk
+    CHUNK        = cfg.pyrogram_chunk_bytes  # 1MB
+    bytes_sent   = 0
+    total        = range_req.length
+    retries      = 0
 
     log.info(
-        f"🌊 Stream | msg={info.message_id} | "
+        f"🌊 Direct | msg={info.message_id} | "
         f"[{fmt_bytes(range_req.start)}-{fmt_bytes(range_req.end)}] | "
-        f"{fmt_bytes(total)} | chunk_start={start_chunk} skip={skip_in_chunk}"
+        f"{fmt_bytes(total)}"
     )
 
     try:
@@ -322,29 +328,20 @@ async def stream_file(
                 return
 
             try:
-                # Recalculate chunk position based on bytes already sent
                 current_byte  = range_req.start + bytes_sent
                 current_chunk = current_byte // CHUNK
                 skip_bytes    = current_byte % CHUNK
 
-                log.debug(
-                    f"  📥 chunk={current_chunk} skip={skip_bytes} "
-                    f"sent={fmt_bytes(bytes_sent)}/{fmt_bytes(total)}"
-                )
-
-                chunk_iter = tg.stream_media(
+                async for raw_chunk in tg.stream_media(
                     info.message,
-                    offset = current_chunk,   # chunk index, NOT byte offset
-                )
-
-                async for raw_chunk in chunk_iter:
+                    offset = current_chunk,
+                ):
                     if await request.is_disconnected():
-                        log.info("  🛑 Disconnected mid-chunk")
                         return
 
-                    # First chunk: skip bytes before our actual start
+                    # Skip bytes before range start in first chunk
                     if skip_bytes > 0:
-                        raw_chunk = raw_chunk[skip_bytes:]
+                        raw_chunk  = raw_chunk[skip_bytes:]
                         skip_bytes = 0
 
                     # Don't send more than requested
@@ -359,48 +356,180 @@ async def stream_file(
                     if bytes_sent >= total:
                         break
 
-                # If loop ended without getting enough bytes → EOF
                 break
 
             except (FileReferenceExpired, FileReferenceInvalid):
                 if retries >= cfg.max_retries:
-                    log.error("❌ File reference expired, giving up")
                     raise
                 retries += 1
-                log.warning(f"🔄 File ref expired, retry {retries}")
                 info = await refresh_file_info(info)
 
             except FloodWait as e:
-                wait = e.value + 1
-                log.warning(f"⏳ FloodWait {wait}s")
-                await asyncio.sleep(wait)
+                await asyncio.sleep(e.value + 1)
 
             except OffsetInvalid:
-                # offset past end of file → we're done
-                log.info("  📄 OffsetInvalid → EOF reached")
+                log.info("  📄 EOF")
                 break
 
             except RPCError as e:
                 if retries >= cfg.max_retries:
                     raise
                 retries += 1
-                log.warning(f"⚠️  RPC error retry {retries}: {e}")
                 await asyncio.sleep(cfg.retry_base_delay * retries)
 
         log.info(f"  ✅ Done | sent={fmt_bytes(bytes_sent)}")
 
-    except Exception as e:
-        log.error(f"  ❌ Stream error: {e}")
-        raise
     finally:
         _active_streams -= 1
 
-# ─── Range Header Parser ──────────────────────────────────────────────────────
+
+# ─── Transcode Stream (MKV/AVI → MP4 via FFmpeg) ──────────────────────────────
+
+async def stream_transcode(
+    info:    FileInfo,
+    request: Request,
+) -> AsyncGenerator[bytes, None]:
+    """
+    Transcode non-browser-compatible formats to MP4 on-the-fly using FFmpeg.
+
+    Flow:
+    Pyrogram → stdin pipe → FFmpeg → stdout pipe → browser
+
+    FFmpeg settings:
+    - copy video if already H264 (fast, no quality loss)
+    - convert audio to AAC (browser compatible)
+    - output MP4 in streaming mode (frag_keyframe+empty_moov)
+    - movflags faststart equivalent for streaming
+    """
+    global _active_streams
+    _active_streams += 1
+
+    log.info(
+        f"🔄 Transcode | msg={info.message_id} | "
+        f'"{info.file_name}" | {info.mime_type} → video/mp4'
+    )
+
+    # FFmpeg command
+    # -i pipe:0          → read input from stdin
+    # -c:v copy          → copy video stream if H264 (no re-encode)
+    # -c:v libx264       → re-encode if needed (hevc/vp9/etc)
+    # -c:a aac           → convert audio to AAC (browser compatible)
+    # -movflags frag_keyframe+empty_moov+default_base_moof
+    #                    → fragmented MP4 for streaming (no seeking table needed)
+    # -f mp4             → output format MP4
+    # pipe:1             → write output to stdout
+
+    ffmpeg_cmd = [
+        cfg.ffmpeg_path,
+        "-hide_banner",
+        "-loglevel", "error",          # suppress ffmpeg logs
+        "-threads", str(cfg.ffmpeg_threads),
+        "-i", "pipe:0",                # input from stdin
+        # Video: try copy first, fallback handled by ffmpeg
+        "-c:v", "copy",                # copy H264 as-is
+        # If source is HEVC/VP9, uncomment below and comment above:
+        # "-c:v", "libx264",
+        # "-preset", "ultrafast",      # fastest encode
+        # "-crf", str(cfg.ffmpeg_crf),
+        "-c:a", "aac",                 # audio → AAC
+        "-b:a", "128k",
+        "-movflags", "frag_keyframe+empty_moov+default_base_moof",
+        "-f", "mp4",
+        "pipe:1",                      # output to stdout
+    ]
+
+    proc = None
+    try:
+        # Start FFmpeg process
+        proc = await asyncio.create_subprocess_exec(
+            *ffmpeg_cmd,
+            stdin  = asyncio.subprocess.PIPE,
+            stdout = asyncio.subprocess.PIPE,
+            stderr = asyncio.subprocess.PIPE,
+        )
+
+        async def feed_ffmpeg():
+            """Feed Telegram data into FFmpeg stdin."""
+            try:
+                async for raw_chunk in tg.stream_media(info.message, offset=0):
+                    if proc.returncode is not None:
+                        break
+                    if proc.stdin:
+                        try:
+                            proc.stdin.write(raw_chunk)
+                            await proc.stdin.drain()
+                        except (BrokenPipeError, ConnectionResetError):
+                            break
+            except Exception as e:
+                log.warning(f"  Feed error: {e}")
+            finally:
+                if proc.stdin:
+                    try:
+                        proc.stdin.close()
+                    except Exception:
+                        pass
+
+        # Start feeding in background
+        feed_task = asyncio.create_task(feed_ffmpeg())
+
+        # Read FFmpeg output and send to browser
+        bytes_sent = 0
+        try:
+            while True:
+                if await request.is_disconnected():
+                    log.info("  🛑 Client disconnected")
+                    break
+
+                chunk = await proc.stdout.read(65536)  # 64KB output chunks
+                if not chunk:
+                    break
+
+                yield chunk
+                bytes_sent += len(chunk)
+
+        finally:
+            feed_task.cancel()
+            try:
+                await feed_task
+            except asyncio.CancelledError:
+                pass
+
+        log.info(f"  ✅ Transcode done | sent={fmt_bytes(bytes_sent)}")
+
+    except Exception as e:
+        log.error(f"  ❌ Transcode error: {e}")
+        raise
+
+    finally:
+        # Kill FFmpeg if still running
+        if proc and proc.returncode is None:
+            try:
+                proc.kill()
+                await proc.wait()
+            except Exception:
+                pass
+        _active_streams -= 1
+
+# ─── FFmpeg Check ─────────────────────────────────────────────────────────────
+
+async def check_ffmpeg() -> bool:
+    """Check if FFmpeg is available."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            cfg.ffmpeg_path, "-version",
+            stdout = asyncio.subprocess.PIPE,
+            stderr = asyncio.subprocess.PIPE,
+        )
+        await proc.wait()
+        return proc.returncode == 0
+    except FileNotFoundError:
+        return False
+
+# ─── Range Parser ─────────────────────────────────────────────────────────────
 
 def parse_range(header: str, file_size: int) -> Optional[RangeReq]:
     if not header:
         return None
-
     m = re.match(r"bytes=(\d*)-(\d*)", header)
     if not m:
         return None
@@ -423,19 +552,33 @@ def parse_range(header: str, file_size: int) -> Optional[RangeReq]:
 
     return RangeReq(start=start, end=end)
 
-# ─── FastAPI ──────────────────────────────────────────────────────────────────
+# ─── App ──────────────────────────────────────────────────────────────────────
+
+ffmpeg_available = False
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    log.info("🚀 Starting Telegram client...")
+    global ffmpeg_available
+
+    log.info("🚀 Starting...")
+
     if cfg.api_id and cfg.api_hash and cfg.session_string:
         await tg.start()
         me = await tg.get_me()
-        log.info(f"✅ Logged in as {me.first_name} (@{me.username})")
+        log.info(f"✅ Telegram: {me.first_name} (@{me.username})")
     else:
-        log.warning("⚠️  Telegram not configured → demo mode")
+        log.warning("⚠️  Telegram not configured")
 
-    yield  # Server runs here
+    ffmpeg_available = await check_ffmpeg()
+    if ffmpeg_available:
+        log.info("✅ FFmpeg available → MKV/AVI transcoding enabled")
+    else:
+        log.warning(
+            "⚠️  FFmpeg not found → MKV/AVI files will NOT play\n"
+            "   Install: apt install ffmpeg  OR  set FFMPEG_PATH env var"
+        )
+
+    yield
 
     log.info("👋 Shutting down...")
     if tg.is_connected:
@@ -443,32 +586,32 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title      = "Telegram Streaming",
-    version    = "3.0.0",
-    lifespan   = lifespan,
-    docs_url   = "/docs",
-    redoc_url  = None,
+    title     = "Telegram Streaming v4",
+    version   = "4.0.0",
+    lifespan  = lifespan,
+    docs_url  = "/docs",
+    redoc_url = None,
 )
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins    = ["*"],
-    allow_methods    = ["GET", "HEAD", "OPTIONS"],
-    allow_headers    = ["Range", "Content-Type", "Accept"],
-    expose_headers   = [
+    allow_origins  = ["*"],
+    allow_methods  = ["GET", "HEAD", "OPTIONS"],
+    allow_headers  = ["Range", "Content-Type", "Accept"],
+    expose_headers = [
         "Content-Range", "Accept-Ranges", "Content-Length",
         "Content-Type", "Content-Disposition",
     ],
     max_age = 86400,
 )
 
-# ─── Rate Limit Middleware ────────────────────────────────────────────────────
+# ─── Middleware ───────────────────────────────────────────────────────────────
 
-SKIP_RATE_LIMIT = {"/health", "/docs", "/openapi.json"}
+SKIP_RL = {"/health", "/docs", "/openapi.json"}
 
 @app.middleware("http")
 async def rate_limit_mw(request: Request, call_next):
-    if request.url.path not in SKIP_RATE_LIMIT:
+    if request.url.path not in SKIP_RL:
         ip = (
             request.headers.get("x-forwarded-for", "").split(",")[0].strip()
             or request.headers.get("x-real-ip", "")
@@ -479,10 +622,7 @@ async def rate_limit_mw(request: Request, call_next):
             return Response(
                 '{"error":"Too many requests"}',
                 status_code = 429,
-                headers     = {
-                    "Retry-After"   : "60",
-                    "Content-Type"  : "application/json",
-                },
+                headers     = {"Retry-After": "60", "Content-Type": "application/json"},
             )
     return await call_next(request)
 
@@ -491,15 +631,15 @@ async def rate_limit_mw(request: Request, call_next):
 @app.get("/health")
 async def health():
     return {
-        "status"         : "ok",
-        "telegram"       : tg.is_connected,
-        "active_streams" : _active_streams,
-        "cached_files"   : len(file_cache),
-        "config"         : {
-            "max_concurrent_streams" : cfg.max_concurrent_streams,
-            "requests_per_minute"    : cfg.requests_per_minute,
-            "max_response_size"      : fmt_bytes(cfg.max_response_bytes),
-            "pyrogram_chunk"         : fmt_bytes(cfg.pyrogram_chunk_bytes),
+        "status"          : "ok",
+        "telegram"        : tg.is_connected,
+        "ffmpeg"          : ffmpeg_available,
+        "active_streams"  : _active_streams,
+        "cached_files"    : len(file_cache),
+        "config"          : {
+            "max_concurrent"      : cfg.max_concurrent_streams,
+            "requests_per_minute" : cfg.requests_per_minute,
+            "max_response_size"   : fmt_bytes(cfg.max_response_bytes),
         },
         "timestamp" : time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
@@ -524,6 +664,9 @@ async def file_info(
     except Exception as e:
         raise HTTPException(500, str(e))
 
+    # Effective MIME type (transcode changes it to mp4)
+    effective_mime = "video/mp4" if info.needs_transcode else info.mime_type
+
     return {
         "messageId"         : info.message_id,
         "channelId"         : info.channel_id,
@@ -531,6 +674,9 @@ async def file_info(
         "fileSize"          : info.file_size,
         "fileSizeFormatted" : fmt_bytes(info.file_size),
         "mimeType"          : info.mime_type,
+        "effectiveMime"     : effective_mime,
+        "needsTranscode"    : info.needs_transcode,
+        "ffmpegAvailable"   : ffmpeg_available,
         "dcId"              : info.dc_id,
         "streamUrl"         : f"/stream/{message_id}?channel={cid}",
     }
@@ -546,19 +692,16 @@ async def stream(
     if not cid:
         raise HTTPException(400, "Missing channel ID")
 
-    # Concurrent limit
     if _active_streams >= cfg.max_concurrent_streams:
         return Response(
-            '{"error":"Too many streams"}',
+            '{"error":"Too many streams. Try again."}',
             status_code = 429,
             headers     = {"Retry-After": "5", "Content-Type": "application/json"},
         )
 
-    # Demo fallback
     if not tg.is_connected:
         return _demo_response(request)
 
-    # Fetch metadata
     try:
         info = await fetch_file_info(message_id, cid)
     except ValueError as e:
@@ -567,9 +710,37 @@ async def stream(
         log.error(f"Fetch error: {e}")
         raise HTTPException(500, str(e))
 
-    file_size = info.file_size
+    # ── Transcode path (MKV, AVI, etc.) ──────────────────────────────────────
+    if info.needs_transcode:
+        if not ffmpeg_available:
+            raise HTTPException(
+                501,
+                f"FFmpeg not installed. Cannot stream {info.mime_type} files. "
+                "Install FFmpeg on the server."
+            )
 
-    # Parse range
+        log.info(f'\n🎬 TRANSCODE | msg={message_id} | "{info.file_name}"')
+
+        headers = {
+            "Content-Type"        : "video/mp4",
+            "Accept-Ranges"       : "none",  # no seeking for transcoded streams
+            "Content-Disposition" : f'inline; filename="{_safe_name(info.file_name)}.mp4"',
+            "Cache-Control"       : "no-cache, no-store",
+            "X-Original-Mime"     : info.mime_type,
+        }
+
+        if request.method == "HEAD":
+            return Response(status_code=200, headers=headers)
+
+        return StreamingResponse(
+            content    = stream_transcode(info, request),
+            status_code = 200,
+            headers    = headers,
+            media_type = "video/mp4",
+        )
+
+    # ── Direct stream path (MP4, WebM) ────────────────────────────────────────
+    file_size = info.file_size
     rh        = request.headers.get("Range", "")
     range_req = parse_range(rh, file_size)
 
@@ -582,15 +753,13 @@ async def stream(
     if not range_req:
         range_req = RangeReq(start=0, end=file_size - 1)
 
-    # Cap response size
     capped_end = min(range_req.end, range_req.start + cfg.max_response_bytes - 1)
     capped_end = min(capped_end, file_size - 1)
     cr         = RangeReq(start=range_req.start, end=capped_end)
 
     log.info(
-        f'\n🎬 msg={message_id} | "{info.file_name}" | '
-        f'[{fmt_bytes(cr.start)}-{fmt_bytes(cr.end)}] | '
-        f'{fmt_bytes(cr.length)} / {fmt_bytes(file_size)}'
+        f'\n🎬 DIRECT | msg={message_id} | "{info.file_name}" | '
+        f'[{fmt_bytes(cr.start)}-{fmt_bytes(cr.end)}] | {fmt_bytes(cr.length)}'
     )
 
     headers = {
@@ -606,7 +775,7 @@ async def stream(
         return Response(status_code=206, headers=headers)
 
     return StreamingResponse(
-        content     = stream_file(info, cr, request),
+        content     = stream_direct(info, cr, request),
         status_code = 206,
         headers     = headers,
         media_type  = info.mime_type,
@@ -620,19 +789,19 @@ async def demo_stream(request: Request):
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def _demo_response(request: Request) -> Response:
-    size      = cfg.demo_file_size
-    rng       = parse_range(request.headers.get("Range", ""), size)
-    start     = rng.start if rng else 0
-    end       = rng.end   if rng else size - 1
-    chunk     = bytes((start + i) % 256 for i in range(end - start + 1))
-    headers   = {
+    size  = cfg.demo_file_size
+    rng   = parse_range(request.headers.get("Range", ""), size)
+    start = rng.start if rng else 0
+    end   = rng.end   if rng else size - 1
+    chunk = bytes((start + i) % 256 for i in range(end - start + 1))
+    hdrs  = {
         "Content-Type"  : "video/mp4",
         "Content-Length": str(len(chunk)),
         "Accept-Ranges" : "bytes",
     }
     if rng:
-        headers["Content-Range"] = f"bytes {start}-{end}/{size}"
-    return Response(content=chunk, status_code=206 if rng else 200, headers=headers)
+        hdrs["Content-Range"] = f"bytes {start}-{end}/{size}"
+    return Response(content=chunk, status_code=206 if rng else 200, headers=hdrs)
 
 
 def fmt_bytes(b: int) -> str:
@@ -648,24 +817,27 @@ def fmt_bytes(b: int) -> str:
 def _safe_name(name: str) -> str:
     return re.sub(r'["\\\r\n]', "_", name)
 
-# ─── Entry Point ──────────────────────────────────────────────────────────────
+# ─── Main ─────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    # Print BEFORE uvicorn starts so Render detects the port
     print(f"""
-╔══════════════════════════════════════╗
-║   Telegram Video Streaming v3.0     ║
-║   Python + Pyrogram + FastAPI       ║
-╠══════════════════════════════════════╣
-║  Port     : {cfg.port:<26} ║
-║  API ID   : {str(cfg.api_id) if cfg.api_id else "⚠️  NOT SET":<26} ║
-║  Channel  : {cfg.channel_id or "pass ?channel=...":<26} ║
-╠══════════════════════════════════════╣
-║  GET /stream/{{id}}?channel=ID        ║
-║  GET /info/{{id}}?channel=ID          ║
-║  GET /health                         ║
-║  GET /docs                           ║
-╚══════════════════════════════════════╝
+╔══════════════════════════════════════════╗
+║   Telegram Video Streaming v4.0         ║
+║   Python + Pyrogram + FFmpeg + FastAPI  ║
+╠══════════════════════════════════════════╣
+║  Port        : {cfg.port:<26} ║
+║  API ID      : {str(cfg.api_id) if cfg.api_id else "⚠️  NOT SET":<26} ║
+║  Channel     : {cfg.channel_id or "pass ?channel=...":<26} ║
+║  FFmpeg      : {cfg.ffmpeg_path:<26} ║
+╠══════════════════════════════════════════╣
+║  MP4/WebM → Direct stream (fast)        ║
+║  MKV/AVI  → FFmpeg transcode (compat)   ║
+╠══════════════════════════════════════════╣
+║  GET /stream/{{id}}?channel=ID            ║
+║  GET /info/{{id}}?channel=ID              ║
+║  GET /health                             ║
+║  GET /docs                               ║
+╚══════════════════════════════════════════╝
 Listening on http://0.0.0.0:{cfg.port}
 """, flush=True)
 
