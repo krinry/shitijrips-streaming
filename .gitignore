@@ -1,5 +1,53 @@
-node_modules/
-dist/
+# Environment
 .env
+.env.local
+.env.*.local
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+.venv/
+venv/
+ENV/
+env/
+.pytest_cache/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Logs
 *.log
+service.log
+logs/
+
+# OS
 .DS_Store
+Thumbs.db
+
+# Cloudflare wrangler
+.wrangler/
+
+# Temporary
+~
+*.tmp
