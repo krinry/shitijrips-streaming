@@ -490,17 +490,18 @@ async function handleStreamRequest(
     let start: number, end: number, status: number;
     let contentRange: string | undefined;
 
+    // Default: send first chunk for streaming
+    // Browser will request more chunks as needed
+    start = 0;
+    end = Math.min(fileSize - 1, CHUNK_SIZE * 2); // 2MB initial chunk
+    status = 206;
+    contentRange = `bytes ${start}-${end}/${fileSize}`;
+    
+    // If specific range requested, use that
     if (range) {
       start = range.start;
       end = range.end;
-      status = 206;
       contentRange = `bytes ${start}-${end}/${fileSize}`;
-    } else {
-      // No range requested, send entire file (for small files only)
-      // For video streaming, we should limit this
-      start = 0;
-      end = Math.min(fileSize - 1, CHUNK_SIZE * 10); // Limit to 10MB for full requests
-      status = 200;
     }
 
     const contentLength = end - start + 1;
