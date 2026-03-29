@@ -14,7 +14,7 @@
 
 import { serve } from "bun";
 import { TelegramClient } from "telegram";
-import { StringSession } from "telegram/sessions/index.js";
+import { StringSession } from "telegram/sessions";
 import cors from "cors";
 import BigInteger from "big-integer";
 
@@ -466,6 +466,27 @@ async function handleStreamRequest(
     if (request.method === "HEAD") {
       const fileSize = await getFileSize(messageId, channelId);
 
+      // Check for Range header in HEAD request
+      const rangeHeader = request.headers.get("Range");
+      const range = parseRangeHeader(rangeHeader || "", fileSize);
+
+      if (range) {
+        // Return 206 Partial Content for HEAD with Range
+        const contentLength = range.end - range.start + 1;
+        return new Response(null, {
+          status: 206,
+          headers: {
+            "Content-Type": "video/mp4",
+            "Content-Length": contentLength.toString(),
+            "Content-Range": `bytes ${range.start}-${range.end}/${fileSize}`,
+            "Accept-Ranges": "bytes",
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Expose-Headers":
+              "Content-Range, Accept-Ranges, Content-Length, Content-Type",
+          },
+        });
+      }
+
       return new Response(null, {
         status: 200,
         headers: {
@@ -490,17 +511,18 @@ async function handleStreamRequest(
     let start: number, end: number, status: number;
     let contentRange: string | undefined;
 
-    // Default: send first chunk for streaming
-    // Browser will request more chunks as needed
-    start = 0;
-    end = Math.min(fileSize - 1, CHUNK_SIZE * 2); // 2MB initial chunk
-    status = 206;
-    contentRange = `bytes ${start}-${end}/${fileSize}`;
-    
-    // If specific range requested, use that
+    // If specific range requested, use that (206 Partial Content)
+    // Otherwise send first chunk for streaming (200 OK with initial data)
     if (range) {
       start = range.start;
       end = range.end;
+      status = 206;
+      contentRange = `bytes ${start}-${end}/${fileSize}`;
+    } else {
+      // Default: send first chunk for streaming
+      start = 0;
+      end = Math.min(fileSize - 1, CHUNK_SIZE * 2); // 2MB initial chunk
+      status = 206;
       contentRange = `bytes ${start}-${end}/${fileSize}`;
     }
 
