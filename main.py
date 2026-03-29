@@ -355,12 +355,19 @@ async def stream_file(
                 extra_before = current_offset - aligned_offset  # bytes before our actual start
 
                 # Calculate limit - we need remaining bytes plus alignment overhead
-                # But Telegram requires minimum 4096 bytes limit
+                # But Telegram requires minimum 4096 bytes limit and power of 2
                 required_limit = remaining + extra_before
+                
+                # Telegram requires limit to be at least 4096 bytes AND a multiple of 4096
+                # Round up to nearest multiple of 4096
                 if required_limit < 4096:
-                    required_limit = 4096  # Telegram minimum
-                elif required_limit > 512 * 1024:
-                    required_limit = 512 * 1024  # Cap at 512KB
+                    required_limit = 4096
+                else:
+                    required_limit = ((required_limit + 4095) // 4096) * 4096
+                
+                # Cap at 512KB maximum
+                if required_limit > 512 * 1024:
+                    required_limit = 512 * 1024
 
                 log.info(f"  📥 Fetching | actual_offset={fmt_bytes(aligned_offset)} | limit={fmt_bytes(required_limit)} | need={fmt_bytes(remaining)}")
 
@@ -698,15 +705,22 @@ async def stream_video(
         # No Range header → start from beginning
         range_req = RangeRequest(start=0, end=file_size - 1)
 
-    # If range end is before start (invalid range from browser), start from beginning
+    # If range end < start, fix it to serve from start
     if range_req.end < range_req.start:
         log.warning(f"⚠️  Invalid range {range_req.start}-{range_req.end}, serving from start")
         range_req = RangeRequest(start=0, end=min(cfg.max_response_bytes, file_size) - 1)
 
-    # Validate range - offset must be < file_size
+    # If range start is beyond file size, return 416
     if range_req.start >= file_size:
-        log.warning(f"⚠️  Range start {range_req.start} >= file size {file_size}, serving from start")
-        range_req = RangeRequest(start=0, end=min(cfg.max_response_bytes, file_size) - 1)
+        log.warning(f"⚠️  Range start {range_req.start} >= file size {file_size}")
+        return Response(
+            status_code = 416,
+            headers     = {
+                "Content-Range"              : f"bytes */{file_size}",
+                "Content-Length"            : "0",
+                "Access-Control-Allow-Origin": "*",
+            },
+        )
 
     # Cap response size so browser gets data fast and seeks work immediately
     capped_end   = min(range_req.end, file_size - 1)
