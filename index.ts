@@ -1,398 +1,435 @@
-/**
- * Telegram Video Streaming Service
- * 
- * This service streams video files from a private Telegram channel
- * with full HTTP Range support for video seeking.
- * 
- * Features:
- * - HTTP 206 Partial Content support
- * - Efficient chunked streaming from Telegram
- * - Rate limit handling with retry logic
- * - File size caching for performance
- * - CORS support for cross-origin requests
- */
-
 import { serve } from "bun";
 import { TelegramClient } from "telegram";
 import { StringSession } from "telegram/sessions";
-import cors from "cors";
+import { Api } from "telegram";
 import BigInteger from "big-integer";
 
-// Configuration
-const PORT = parseInt(process.env.PORT || "3031");
-const CHUNK_SIZE = 1024 * 1024; // 1MB chunks
+const PORT = parseInt(process.env.PORT || "3030");
+const MAX_RESPONSE_SIZE = 4 * 1024 * 1024; // 4MB per HTTP response
 const MAX_RETRIES = 3;
-const RETRY_DELAY = 1000; // 1 second
+const RETRY_DELAY = 1000;
 
-// Environment variables (set these in production)
 const API_ID = parseInt(process.env.TELEGRAM_API_ID || "0");
 const API_HASH = process.env.TELEGRAM_API_HASH || "";
 const SESSION_STRING = process.env.TELEGRAM_SESSION || "";
 const CHANNEL_ID = process.env.TELEGRAM_CHANNEL_ID || "";
 
-// Validate configuration
-if (!API_ID || !API_HASH) {
-  console.warn("⚠️  Warning: TELEGRAM_API_ID and TELEGRAM_API_HASH not set");
-  console.warn("   Set these environment variables for Telegram connectivity");
+// ─── Telegram Rules ───────────────────────────────────────────────────────────
+// Rule 1: limit MUST be one of these exact values (power of 2)
+// Rule 2: offset MUST be a multiple of limit (NOT just 4096!)
+// Rule 3: max limit is 1MB
+//
+// Example: if limit=1MB, offset must be 0, 1MB, 2MB, 3MB... (multiples of 1MB)
+//          if limit=512KB, offset must be 0, 512KB, 1MB... (multiples of 512KB)
+//
+// We use 128KB as our fixed chunk size because:
+// - Small enough for smooth streaming
+// - Large enough for efficiency  
+// - offset alignment is easy: any multiple of 131072
+const CHUNK_SIZE = 131072; // 128KB - fixed size, never changes
+
+// ─── Types ────────────────────────────────────────────────────────────────────
+
+interface FileInfo {
+  size: number;
+  dcId: number;
+  accessHash: bigint;
+  fileReference: Buffer;
+  id: bigint;
+  mimeType: string;
+  timestamp: number;
 }
 
-// File size cache to avoid repeated API calls
-const fileSizeCache = new Map<string, { size: number; timestamp: number }>();
-const CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+// ─── Cache ────────────────────────────────────────────────────────────────────
 
-// Telegram client singleton
+const fileInfoCache = new Map<string, FileInfo>();
+const CACHE_TTL = 10 * 60 * 1000;
+
+// ─── Telegram Client ──────────────────────────────────────────────────────────
+
 let telegramClient: TelegramClient | null = null;
-let isConnecting = false;
 let connectionPromise: Promise<void> | null = null;
 
-/**
- * Initialize Telegram client with connection pooling
- */
-async function initializeTelegramClient(): Promise<void> {
-  if (telegramClient && telegramClient.connected) {
-    return;
-  }
+async function getTelegramClient(): Promise<TelegramClient> {
+  if (telegramClient?.connected) return telegramClient;
 
-  if (isConnecting && connectionPromise) {
-    await connectionPromise;
-    return;
-  }
-
-  isConnecting = true;
-  connectionPromise = (async () => {
-    try {
+  if (!connectionPromise) {
+    connectionPromise = (async () => {
       const session = new StringSession(SESSION_STRING);
       telegramClient = new TelegramClient(session, API_ID, API_HASH, {
         connectionRetries: 5,
-        timeout: 10000,
-        useWSS: false, // Use plain TCP for better compatibility
+        timeout: 30000,
+        useWSS: false,
       });
-
       await telegramClient.connect();
-      console.log("✅ Telegram client connected successfully");
-    } catch (error) {
-      console.error("❌ Failed to connect to Telegram:", error);
+      console.log("✅ Telegram connected");
+    })().catch((err) => {
+      connectionPromise = null;
       telegramClient = null;
-      throw error;
-    } finally {
-      isConnecting = false;
-    }
-  })();
+      throw err;
+    });
+  }
 
   await connectionPromise;
+  return telegramClient!;
 }
 
-/**
- * Get file size from cache or fetch from Telegram
- */
-async function getFileSize(
+// ─── File Info ────────────────────────────────────────────────────────────────
+
+async function getFileInfo(
   messageId: string,
   channelId: string
-): Promise<number> {
+): Promise<FileInfo> {
   const cacheKey = `${channelId}:${messageId}`;
-  const cached = fileSizeCache.get(cacheKey);
+  const cached = fileInfoCache.get(cacheKey);
+  if (cached && Date.now() - cached.timestamp < CACHE_TTL) return cached;
 
-  if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
-    return cached.size;
+  const client = await getTelegramClient();
+  const messages = await client.getMessages(channelId, {
+    ids: [parseInt(messageId)],
+  });
+
+  if (!messages?.length || !messages[0]) {
+    throw new Error(`Message ${messageId} not found`);
   }
 
-  try {
-    await initializeTelegramClient();
-
-    if (!telegramClient) {
-      throw new Error("Telegram client not initialized");
-    }
-
-    // Get the message to extract file size
-    // For private channels, use the string format directly
-    console.log("Fetching message:", messageId, "from channel:", channelId);
-    const response = await telegramClient.getMessages(
-      channelId, // Pass as string, client will resolve
-      { ids: [parseInt(messageId)] }
-    );
-
-    // Handle both array and object response formats
-    let messages;
-    if (Array.isArray(response)) {
-      messages = response;
-    } else if (response && typeof response === 'object') {
-      // Check if it's array-like with numeric keys
-      if ('0' in response && response.messages) {
-        messages = Array.isArray(response.messages) ? response.messages : [];
-      } else {
-        // Try to convert array-like object
-        messages = Object.values(response).filter(v => v && typeof v === 'object' && 'className' in v);
-      }
-    } else {
-      messages = [];
-    }
-    console.log("Messages returned:", messages?.length, "Type:", typeof messages, "Response:", response ? Object.keys(response) : null);
-    if (messages && messages.length > 0 && messages[0]) {
-      console.log("First message keys:", Object.keys(messages[0]));
-    }
-
-    if (!messages || messages.length === 0) {
-      throw new Error("Message not found");
-    }
-
-    const message = messages[0];
-    
-    // Debug: Log message structure
-    console.log("Message type:", message.className);
-    console.log("Has media?", "media" in message);
-    console.log("Has document?", "document" in message);
-    
-    // Try different ways to get media
-    console.log("Message class name:", message.className);
-    console.log("Message keys:", Object.keys(message));
-    
-    let media = null;
-    
-    // Check for different media types
-    if ("media" in message) {
-      media = (message as any).media;
-      console.log("Found media property");
-    } else if ("document" in message) {
-      media = (message as any).document;
-      console.log("Found document property");
-    } else if ("photo" in message) {
-      media = (message as any).photo;
-      console.log("Found photo property");
-    } else if ("video" in message) {
-      media = (message as any).video;
-      console.log("Found video property");
-    } else if ("animation" in message) {
-      media = (message as any).animation;
-      console.log("Found animation property");
-    } else if ("sticker" in message) {
-      media = (message as any).sticker;
-      console.log("Found sticker property");
-    } else {
-      console.log("No known media properties found");
-    }
-    
-    console.log("Media object:", media);
-    console.log("Media keys:", media ? Object.keys(media) : null);
-    
-    if (!media) {
-      throw new Error("No media found in message");
-    }
-    
-    // Get file size - handle BigInteger from telegram library
-    let size = 0;
-    const doc = media.document;
-    if (doc) {
-      const docSize = doc.size;
-      if (docSize && typeof docSize === 'object' && 'value' in docSize) {
-        // It's a BigInteger with a value property
-        size = Number(docSize.value);
-      } else if (typeof docSize === 'bigint') {
-        size = Number(docSize);
-      } else if (typeof docSize === 'number') {
-        size = docSize;
-      } else if (typeof docSize === 'string') {
-        size = parseInt(docSize, 10);
-      }
-    }
-    console.log("File size:", size, "bytes");
-
-    // Cache the file size
-    fileSizeCache.set(cacheKey, { size, timestamp: Date.now() });
-
-    return size;
-  } catch (error) {
-    console.error("Error getting file size:", error);
-    throw error;
+  const msg = messages[0];
+  if (!(msg.media instanceof Api.MessageMediaDocument)) {
+    throw new Error(`Message ${messageId} is not a document`);
   }
+
+  const document = msg.media.document;
+  if (!(document instanceof Api.Document)) {
+    throw new Error("Invalid document");
+  }
+
+  const rawSize = document.size;
+  let size: number;
+  if (typeof rawSize === "bigint") size = Number(rawSize);
+  else if (rawSize && typeof rawSize === "object" && "toJSNumber" in rawSize)
+    size = (rawSize as any).toJSNumber();
+  else size = Number(rawSize);
+
+  const info: FileInfo = {
+    id: document.id as bigint,
+    accessHash: document.accessHash as bigint,
+    fileReference: Buffer.from(document.fileReference),
+    dcId: document.dcId,
+    size,
+    mimeType: document.mimeType || "video/mp4",
+    timestamp: Date.now(),
+  };
+
+  fileInfoCache.set(cacheKey, info);
+  console.log(`📁 Cached: msg=${messageId} | ${formatBytes(size)} | dc=${info.dcId} | ${info.mimeType}`);
+  return info;
 }
 
+// ─── Core: Aligned Fetch ──────────────────────────────────────────────────────
+
 /**
- * Download a chunk of a file from Telegram with retry logic
+ * THE KEY FIX:
+ * 
+ * Telegram rule: offset % limit === 0  (MUST be true)
+ * 
+ * We use FIXED chunk size (128KB) always.
+ * offset must always be multiple of 128KB.
+ * 
+ * To fetch byte range [start, end]:
+ * 1. Find which 128KB block contains `start`
+ *    blockIndex = floor(start / CHUNK_SIZE)
+ *    blockOffset = blockIndex * CHUNK_SIZE  ← always valid!
+ * 2. Fetch from blockOffset with limit=CHUNK_SIZE
+ * 3. Slice result to get exact [start, end] bytes
  */
-async function downloadChunk(
-  messageId: string,
-  channelId: string,
-  offset: number,
-  limit: number,
-  retryCount = 0
+function getBlockOffset(bytePosition: number): number {
+  // Which 128KB block does this byte belong to?
+  const blockIndex = Math.floor(bytePosition / CHUNK_SIZE);
+  // Offset of that block (always multiple of CHUNK_SIZE = valid!)
+  return blockIndex * CHUNK_SIZE;
+}
+
+async function fetchBlock(
+  info: FileInfo,
+  blockOffset: number  // MUST be multiple of CHUNK_SIZE
 ): Promise<Uint8Array> {
-  try {
-    await initializeTelegramClient();
+  // Verify alignment (safety check)
+  if (blockOffset % CHUNK_SIZE !== 0) {
+    throw new Error(
+      `BUG: blockOffset ${blockOffset} is not aligned to CHUNK_SIZE ${CHUNK_SIZE}`
+    );
+  }
 
-    if (!telegramClient) {
-      throw new Error("Telegram client not initialized");
+  const client = await getTelegramClient();
+  let lastError: any;
+
+  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+    try {
+      const result = await client.invoke(
+        new Api.upload.GetFile({
+          location: new Api.InputDocumentFileLocation({
+            id: BigInteger(info.id.toString()),
+            accessHash: BigInteger(info.accessHash.toString()),
+            fileReference: info.fileReference,
+            thumbSize: "",
+          }),
+          offset: BigInteger(blockOffset),
+          limit: CHUNK_SIZE,  // Always 128KB - never changes
+          precise: true,
+        })
+      );
+
+      if (result instanceof Api.upload.File) {
+        return new Uint8Array(result.bytes);
+      }
+
+      if (result instanceof Api.upload.FileCdnRedirect) {
+        const cdnResult = await client.invoke(
+          new Api.upload.GetCdnFile({
+            fileToken: result.fileToken,
+            offset: BigInteger(blockOffset),
+            limit: CHUNK_SIZE,
+          })
+        );
+        if (cdnResult instanceof Api.upload.CdnFile) {
+          return new Uint8Array(cdnResult.bytes);
+        }
+      }
+
+      throw new Error("Unknown result type from GetFile");
+    } catch (err: any) {
+      lastError = err;
+      const msg = err?.message || err?.errorMessage || "";
+
+      if (msg.includes("FLOOD")) {
+        const wait = RETRY_DELAY * Math.pow(2, attempt);
+        console.warn(`⏳ Flood wait ${wait}ms...`);
+        await sleep(wait);
+        continue;
+      }
+
+      if (msg.includes("FILE_REFERENCE")) {
+        console.warn("🔄 File reference expired, clearing cache...");
+        for (const [key, val] of fileInfoCache.entries()) {
+          if (val.id === info.id) fileInfoCache.delete(key);
+        }
+        throw new Error("FILE_REFERENCE_EXPIRED: Please retry the request");
+      }
+
+      // Don't retry other errors
+      throw err;
     }
+  }
 
-    // Use BigFile for efficient chunked downloads
-    const chunk = await telegramClient.downloadFile(
-      {
-        location: {
-          _: "inputDocumentFileLocation",
-          id: BigInt(messageId),
-          accessHash: BigInt(0), // Will be fetched automatically
-          fileReference: Buffer.from([]),
+  throw lastError;
+}
+
+// ─── Streaming ────────────────────────────────────────────────────────────────
+
+function createStream(
+  info: FileInfo,
+  start: number,
+  end: number
+): ReadableStream {
+  let cancelled = false;
+
+  return new ReadableStream({
+    async start(controller) {
+      // Find the first aligned block that contains `start`
+      let currentBlockOffset = getBlockOffset(start);
+      let bytesSent = 0;
+      const totalNeeded = end - start + 1;
+
+      console.log(
+        `🌊 Stream: [${start}-${end}] = ${formatBytes(totalNeeded)}\n` +
+        `   First block offset: ${currentBlockOffset} ` +
+        `(block #${currentBlockOffset / CHUNK_SIZE})`
+      );
+
+      try {
+        while (bytesSent < totalNeeded) {
+          // Stop if browser disconnected
+          if (cancelled) {
+            console.log("  🛑 Cancelled, stopping");
+            return;
+          }
+
+          console.log(
+            `  📥 block=${currentBlockOffset} (${formatBytes(CHUNK_SIZE)}) | ` +
+            `sent=${formatBytes(bytesSent)}/${formatBytes(totalNeeded)}`
+          );
+
+          // Fetch the aligned 128KB block from Telegram
+          const block = await fetchBlock(info, currentBlockOffset);
+
+          if (block.length === 0) {
+            console.warn("  ⚠️  Empty block, stopping");
+            break;
+          }
+
+          // Check again after async fetch
+          if (cancelled) {
+            console.log("  🛑 Cancelled after fetch, discarding");
+            return;
+          }
+
+          // Block covers bytes [currentBlockOffset, currentBlockOffset + block.length - 1]
+          // We need bytes [start, end]
+          // Calculate the overlap
+          const blockAbsStart = currentBlockOffset;
+          const blockAbsEnd = currentBlockOffset + block.length - 1;
+
+          const overlapStart = Math.max(blockAbsStart, start);
+          const overlapEnd = Math.min(blockAbsEnd, end);
+
+          if (overlapStart <= overlapEnd) {
+            // Slice only the bytes we need from this block
+            const sliceFrom = overlapStart - blockAbsStart;
+            const sliceTo = overlapEnd - blockAbsStart + 1;
+            const slice = block.slice(sliceFrom, sliceTo);
+
+            try {
+              controller.enqueue(slice);
+              bytesSent += slice.length;
+            } catch (e: any) {
+              if (e?.code === "ERR_INVALID_STATE") {
+                console.log("  🛑 Controller closed (seek/tab close)");
+                return;
+              }
+              throw e;
+            }
+          }
+
+          // Move to next block
+          currentBlockOffset += CHUNK_SIZE;
+
+          // EOF: block was smaller than CHUNK_SIZE
+          if (block.length < CHUNK_SIZE) {
+            console.log("  📄 EOF");
+            break;
+          }
+        }
+
+        if (!cancelled) {
+          controller.close();
+          console.log(`  ✅ Done: sent ${formatBytes(bytesSent)}`);
+        }
+      } catch (err: any) {
+        if (cancelled) {
+          console.log("  🛑 Error after cancel:", err.message);
+          return;
+        }
+        console.error("  ❌ Stream error:", err.message);
+        try {
+          controller.error(err);
+        } catch {
+          // Already closed
+        }
+      }
+    },
+
+    cancel(reason) {
+      cancelled = true;
+      console.log(`  🛑 Browser cancelled: ${reason || "seek/close"}`);
+    },
+  });
+}
+
+// ─── Route Handlers ───────────────────────────────────────────────────────────
+
+async function handleStreamRequest(
+  request: Request,
+  messageId: string
+): Promise<Response> {
+  const url = new URL(request.url);
+  const channelId = url.searchParams.get("channel") || CHANNEL_ID;
+
+  if (!channelId) {
+    return jsonError(400, "Missing channel ID");
+  }
+
+  try {
+    const info = await getFileInfo(messageId, channelId);
+
+    if (request.method === "HEAD") {
+      return new Response(null, {
+        status: 200,
+        headers: {
+          "Content-Type": info.mimeType,
+          "Content-Length": info.size.toString(),
+          "Accept-Ranges": "bytes",
+          "Access-Control-Allow-Origin": "*",
         },
-        fileSize: await getFileSize(messageId, channelId),
-      } as any,
-      {
-        offsetBytes: offset,
-        limit: Math.min(limit, CHUNK_SIZE),
-        dcId: 0, // Use any DC
-      }
-    );
-
-    return new Uint8Array(chunk as ArrayBuffer);
-  } catch (error: any) {
-    // Handle rate limiting
-    if (error.message?.includes("FLOOD") && retryCount < MAX_RETRIES) {
-      const waitTime = RETRY_DELAY * Math.pow(2, retryCount);
-      console.warn(`Rate limited, waiting ${waitTime}ms before retry...`);
-      await new Promise((resolve) => setTimeout(resolve, waitTime));
-      return downloadChunk(messageId, channelId, offset, limit, retryCount + 1);
+      });
     }
 
-    throw error;
-  }
-}
+    // Parse Range header
+    const rangeHeader = request.headers.get("Range");
+    let start: number;
+    let end: number;
 
-/**
- * Alternative chunk download using message iteration
- * This is more reliable for large files
- */
-async function downloadChunkFromMessage(
-  messageId: string,
-  channelId: string,
-  offset: number,
-  limit: number
-): Promise<Uint8Array> {
-  try {
-    await initializeTelegramClient();
-
-    if (!telegramClient) {
-      throw new Error("Telegram client not initialized");
-    }
-
-    // Get the message with the file
-    const response = await telegramClient.getMessages(
-      channelId,
-      { ids: [parseInt(messageId)] }
-    );
-
-    // Handle both array and object response formats
-    let messages;
-    if (Array.isArray(response)) {
-      messages = response;
-    } else if (response && typeof response === 'object') {
-      // Check if it's array-like with numeric keys
-      if ('0' in response && response.messages) {
-        messages = Array.isArray(response.messages) ? response.messages : [];
-      } else {
-        // Try to convert array-like object
-        messages = Object.values(response).filter(v => v && typeof v === 'object' && 'className' in v);
+    if (rangeHeader) {
+      const range = parseRangeHeader(rangeHeader, info.size);
+      if (!range) {
+        return new Response(null, {
+          status: 416,
+          headers: {
+            "Content-Range": `bytes */${info.size}`,
+            "Access-Control-Allow-Origin": "*",
+          },
+        });
       }
+      start = range.start;
+      end = range.end;
     } else {
-      messages = [];
+      start = 0;
+      end = info.size - 1;
     }
 
-    if (!messages || messages.length === 0) {
-      throw new Error("Message not found");
-    }
+    // Cap response size
+    const cappedEnd = Math.min(end, start + MAX_RESPONSE_SIZE - 1);
+    const contentLength = cappedEnd - start + 1;
 
-    const message = messages[0];
-    
-    // Debug: Log what we got
-    console.log("Message response:", JSON.stringify(message, (key, value) => 
-      typeof value === 'bigint' ? value.toString() : value, 2));
-    
-    if (!message || !("media" in message) || !message.media) {
-      // Check if it's a service message or other type
-      if ("message" in message) {
-        console.log("Message is text:", message.message);
-      }
-      throw new Error("No media found in message");
-    }
+    console.log(
+      `\n🎬 msg=${messageId} | ` +
+      `[${start}-${cappedEnd}] | ` +
+      `${formatBytes(contentLength)} | ` +
+      `file=${formatBytes(info.size)}`
+    );
 
-    // Download specific bytes using iterDownload
-    const chunks: Uint8Array[] = [];
-    for await (const chunk of telegramClient.iterDownload({
-      file: message.media as any,
-      offset: BigInteger(offset),
-      limit,
-      requestSize: limit,
-    })) {
-      chunks.push(new Uint8Array(chunk));
-    }
+    const stream = createStream(info, start, cappedEnd);
 
-    // Combine chunks
-    const totalLength = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
-    const result = new Uint8Array(totalLength);
-    let position = 0;
-    for (const chunk of chunks) {
-      result.set(chunk, position);
-      position += chunk.length;
-    }
-
-    return result;
-  } catch (error) {
-    console.error("Error in downloadChunkFromMessage:", error);
-    throw error;
+    return new Response(stream, {
+      status: 206,
+      headers: {
+        "Content-Type": info.mimeType,
+        "Content-Length": contentLength.toString(),
+        "Content-Range": `bytes ${start}-${cappedEnd}/${info.size}`,
+        "Accept-Ranges": "bytes",
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Expose-Headers":
+          "Content-Range, Accept-Ranges, Content-Length, Content-Type",
+        "Cache-Control": "no-cache, no-store",
+      },
+    });
+  } catch (err: any) {
+    console.error("❌ Handler error:", err.message);
+    return jsonError(500, err.message || "Internal Server Error");
   }
 }
 
-/**
- * Parse HTTP Range header
- */
-function parseRangeHeader(
-  rangeHeader: string,
-  fileSize: number
-): { start: number; end: number } | null {
-  if (!rangeHeader) return null;
+// ─── Main Router ──────────────────────────────────────────────────────────────
 
-  const match = rangeHeader.match(/bytes=(\d+)?-(\d+)?/);
-  if (!match) return null;
-
-  const start = match[1] ? parseInt(match[1]) : 0;
-  const end = match[2] ? parseInt(match[2]) : fileSize - 1;
-
-  // Validate range
-  if (start >= fileSize || end >= fileSize || start > end) {
-    return null;
-  }
-
-  return { start, end };
-}
-
-/**
- * Generate demo video data for testing without Telegram
- * This creates a simple test pattern
- */
-function generateDemoChunk(start: number, end: number): Uint8Array {
-  const size = end - start + 1;
-  const chunk = new Uint8Array(size);
-
-  // Create a simple pattern for testing
-  for (let i = 0; i < size; i++) {
-    chunk[i] = (start + i) % 256;
-  }
-
-  return chunk;
-}
-
-/**
- * Main request handler
- */
 async function handleRequest(request: Request): Promise<Response> {
   const url = new URL(request.url);
 
-  // Handle CORS preflight
   if (request.method === "OPTIONS") {
     return new Response(null, {
       status: 204,
       headers: {
         "Access-Control-Allow-Origin": "*",
         "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
-        "Access-Control-Allow-Headers":
-          "Range, Content-Type, Accept, Accept-Encoding",
+        "Access-Control-Allow-Headers": "Range, Content-Type",
         "Access-Control-Expose-Headers":
           "Content-Range, Accept-Ranges, Content-Length, Content-Type",
         "Access-Control-Max-Age": "86400",
@@ -400,342 +437,98 @@ async function handleRequest(request: Request): Promise<Response> {
     });
   }
 
-  // Health check endpoint
   if (url.pathname === "/health") {
     return new Response(
       JSON.stringify({
         status: "ok",
-        telegram: telegramClient?.connected || false,
-        timestamp: new Date().toISOString(),
+        connected: telegramClient?.connected ?? false,
+        cachedFiles: fileInfoCache.size,
+        chunkSize: formatBytes(CHUNK_SIZE),
+        maxResponse: formatBytes(MAX_RESPONSE_SIZE),
       }),
-      {
-        headers: {
-          "Content-Type": "application/json",
-          "Access-Control-Allow-Origin": "*",
-        },
-      }
+      { headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } }
     );
   }
 
-  // Stream endpoint: /stream/:messageId
-  const streamMatch = url.pathname.match(/^\/stream\/(.+)$/);
-  if (streamMatch) {
-    return handleStreamRequest(request, streamMatch[1]);
-  }
+  const streamMatch = url.pathname.match(/^\/stream\/(\d+)$/);
+  if (streamMatch) return handleStreamRequest(request, streamMatch[1]);
 
-  // File info endpoint: /info/:messageId
-  const infoMatch = url.pathname.match(/^\/info\/(.+)$/);
+  const infoMatch = url.pathname.match(/^\/info\/(\d+)$/);
   if (infoMatch) {
-    return handleInfoRequest(infoMatch[1]);
-  }
-
-  // Demo stream endpoint for testing without Telegram
-  if (url.pathname === "/demo-stream") {
-    return handleDemoStream(request);
-  }
-
-  // 404 for unknown routes
-  return new Response(
-    JSON.stringify({
-      error: "Not Found",
-      path: url.pathname,
-      availableEndpoints: ["/stream/:messageId", "/info/:messageId", "/health", "/demo-stream"],
-    }),
-    {
-      status: 404,
-      headers: {
-        "Content-Type": "application/json",
-        "Access-Control-Allow-Origin": "*",
-      },
-    }
-  );
-}
-
-/**
- * Handle stream requests with Range support
- */
-async function handleStreamRequest(
-  request: Request,
-  messageId: string
-): Promise<Response> {
-  try {
-    const url = new URL(request.url);
     const channelId = url.searchParams.get("channel") || CHANNEL_ID;
-
-    // Check if this is a HEAD request for file info
-    if (request.method === "HEAD") {
-      const fileSize = await getFileSize(messageId, channelId);
-
-      // Check for Range header in HEAD request
-      const rangeHeader = request.headers.get("Range");
-      const range = parseRangeHeader(rangeHeader || "", fileSize);
-
-      if (range) {
-        // Return 206 Partial Content for HEAD with Range
-        const contentLength = range.end - range.start + 1;
-        return new Response(null, {
-          status: 206,
-          headers: {
-            "Content-Type": "video/mp4",
-            "Content-Length": contentLength.toString(),
-            "Content-Range": `bytes ${range.start}-${range.end}/${fileSize}`,
-            "Accept-Ranges": "bytes",
-            "Access-Control-Allow-Origin": "*",
-            "Access-Control-Expose-Headers":
-              "Content-Range, Accept-Ranges, Content-Length, Content-Type",
-          },
-        });
-      }
-
-      return new Response(null, {
-        status: 200,
-        headers: {
-          "Content-Type": "video/mp4",
-          "Content-Length": fileSize.toString(),
-          "Accept-Ranges": "bytes",
-          "Access-Control-Allow-Origin": "*",
-          "Access-Control-Expose-Headers":
-            "Content-Range, Accept-Ranges, Content-Length, Content-Type",
-        },
-      });
-    }
-
-    // Get file size
-    const fileSize = await getFileSize(messageId, channelId);
-
-    // Parse Range header
-    const rangeHeader = request.headers.get("Range");
-    const range = parseRangeHeader(rangeHeader || "", fileSize);
-
-    // Determine content range and status
-    let start: number, end: number, status: number;
-    let contentRange: string | undefined;
-
-    // If specific range requested, use that (206 Partial Content)
-    // Otherwise send first chunk for streaming (200 OK with initial data)
-    if (range) {
-      start = range.start;
-      end = range.end;
-      status = 206;
-      contentRange = `bytes ${start}-${end}/${fileSize}`;
-    } else {
-      // Default: send first chunk for streaming
-      start = 0;
-      end = Math.min(fileSize - 1, CHUNK_SIZE * 2); // 2MB initial chunk
-      status = 206;
-      contentRange = `bytes ${start}-${end}/${fileSize}`;
-    }
-
-    const contentLength = end - start + 1;
-
-    // Try to download chunk from Telegram
-    let chunk: Uint8Array;
-
     try {
-      // Check if Telegram is configured
-      if (API_ID && API_HASH && SESSION_STRING) {
-        chunk = await downloadChunkFromMessage(
-          messageId,
-          channelId,
-          start,
-          contentLength
-        );
-      } else {
-        // Fallback to demo mode
-        console.warn(
-          "⚠️  Telegram not configured, returning demo content. Set TELEGRAM_API_ID, TELEGRAM_API_HASH, and TELEGRAM_SESSION."
-        );
-        chunk = generateDemoChunk(start, end);
-      }
-    } catch (error) {
-      console.error("Error downloading chunk:", error);
-
-      // Return demo content if Telegram fails
-      if (!rangeHeader) {
-        return new Response(
-          JSON.stringify({
-            error: "Failed to stream from Telegram",
-            message: error instanceof Error ? error.message : "Unknown error",
-            hint: "Make sure Telegram credentials are configured correctly",
-          }),
-          {
-            status: 500,
-            headers: {
-              "Content-Type": "application/json",
-              "Access-Control-Allow-Origin": "*",
-            },
-          }
-        );
-      }
-
-      // For range requests, return demo chunk
-      chunk = generateDemoChunk(start, end);
-    }
-
-    // Build response headers
-    const headers: Record<string, string> = {
-      "Content-Type": "video/mp4",
-      "Content-Length": chunk.length.toString(),
-      "Accept-Ranges": "bytes",
-      "Access-Control-Allow-Origin": "*",
-      "Access-Control-Expose-Headers":
-        "Content-Range, Accept-Ranges, Content-Length, Content-Type",
-      // Cache headers
-      "Cache-Control": "public, max-age=3600",
-    };
-
-    if (contentRange) {
-      headers["Content-Range"] = contentRange;
-    }
-
-    return new Response(chunk, { status, headers });
-  } catch (error) {
-    console.error("Stream error:", error);
-
-    return new Response(
-      JSON.stringify({
-        error: "Internal Server Error",
-        message: error instanceof Error ? error.message : "Unknown error",
-      }),
-      {
-        status: 500,
-        headers: {
-          "Content-Type": "application/json",
-          "Access-Control-Allow-Origin": "*",
-        },
-      }
-    );
-  }
-}
-
-/**
- * Handle file info requests
- */
-async function handleInfoRequest(messageId: string): Promise<Response> {
-  try {
-    const channelId = CHANNEL_ID;
-
-    if (!API_ID || !API_HASH) {
+      const info = await getFileInfo(infoMatch[1], channelId);
       return new Response(
         JSON.stringify({
-          error: "Telegram not configured",
-          hint: "Set TELEGRAM_API_ID, TELEGRAM_API_HASH, and TELEGRAM_SESSION environment variables",
+          messageId: infoMatch[1],
+          size: info.size,
+          sizeFormatted: formatBytes(info.size),
+          mimeType: info.mimeType,
+          dcId: info.dcId,
+          streamUrl: `/stream/${infoMatch[1]}`,
         }),
-        {
-          status: 503,
-          headers: {
-            "Content-Type": "application/json",
-            "Access-Control-Allow-Origin": "*",
-          },
-        }
+        { headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } }
       );
+    } catch (err: any) {
+      return jsonError(500, err.message);
     }
-
-    const fileSize = await getFileSize(messageId, channelId);
-
-    return new Response(
-      JSON.stringify({
-        messageId,
-        channelId,
-        fileSize,
-        fileSizeFormatted: formatBytes(fileSize),
-        streamUrl: `/stream/${messageId}`,
-      }),
-      {
-        headers: {
-          "Content-Type": "application/json",
-          "Access-Control-Allow-Origin": "*",
-        },
-      }
-    );
-  } catch (error) {
-    return new Response(
-      JSON.stringify({
-        error: "Failed to get file info",
-        message: error instanceof Error ? error.message : "Unknown error",
-      }),
-      {
-        status: 500,
-        headers: {
-          "Content-Type": "application/json",
-          "Access-Control-Allow-Origin": "*",
-        },
-      }
-    );
   }
+
+  return jsonError(404, "Not Found");
 }
 
-/**
- * Demo stream handler for testing without Telegram
- * Returns a valid video stream with Range support
- */
-function handleDemoStream(request: Request): Response {
-  // Create a fake video file size (10MB)
-  const DEMO_FILE_SIZE = 10 * 1024 * 1024;
+// ─── Helpers ──────────────────────────────────────────────────────────────────
 
-  // Parse Range header
-  const rangeHeader = request.headers.get("Range");
-  const range = parseRangeHeader(rangeHeader || "", DEMO_FILE_SIZE);
+function parseRangeHeader(
+  header: string,
+  fileSize: number
+): { start: number; end: number } | null {
+  const match = header.match(/bytes=(\d*)-(\d*)/);
+  if (!match) return null;
 
-  let start: number, end: number, status: number;
-  let contentRange: string | undefined;
+  let start: number;
+  let end: number;
 
-  if (range) {
-    start = range.start;
-    end = range.end;
-    status = 206;
-    contentRange = `bytes ${start}-${end}/${DEMO_FILE_SIZE}`;
+  if (match[1] === "" && match[2] !== "") {
+    const suffix = parseInt(match[2]);
+    start = Math.max(0, fileSize - suffix);
+    end = fileSize - 1;
   } else {
-    start = 0;
-    end = DEMO_FILE_SIZE - 1;
-    status = 200;
+    start = match[1] !== "" ? parseInt(match[1]) : 0;
+    end = match[2] !== "" ? parseInt(match[2]) : fileSize - 1;
   }
 
-  // Generate demo chunk
-  const chunk = generateDemoChunk(start, end);
-
-  const headers: Record<string, string> = {
-    "Content-Type": "video/mp4",
-    "Content-Length": chunk.length.toString(),
-    "Accept-Ranges": "bytes",
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Expose-Headers":
-      "Content-Range, Accept-Ranges, Content-Length, Content-Type",
-  };
-
-  if (contentRange) {
-    headers["Content-Range"] = contentRange;
-  }
-
-  return new Response(chunk, { status, headers });
+  end = Math.min(end, fileSize - 1);
+  if (start < 0 || start > end || start >= fileSize) return null;
+  return { start, end };
 }
 
-/**
- * Format bytes to human readable string
- */
 function formatBytes(bytes: number): string {
-  if (bytes === 0) return "0 Bytes";
-
-  const k = 1024;
-  const sizes = ["Bytes", "KB", "MB", "GB", "TB"];
-  const i = Math.floor(Math.log(bytes) / Math.log(k));
-
-  return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + " " + sizes[i];
+  if (bytes === 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB"];
+  const i = Math.floor(Math.log(bytes) / Math.log(1024));
+  return `${(bytes / Math.pow(1024, i)).toFixed(2)} ${units[i]}`;
 }
 
-// Start the server
-console.log(`🚀 Streaming Service starting on port ${PORT}`);
-console.log(`📡 Available endpoints:`);
-console.log(`   - GET /stream/:messageId - Stream video with Range support`);
-console.log(`   - GET /info/:messageId - Get file information`);
-console.log(`   - GET /demo-stream - Demo stream for testing`);
-console.log(`   - GET /health - Health check`);
-console.log(``);
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
 
-serve({
-  port: PORT,
-  fetch: handleRequest,
-  idleTimeout: 60,
-});
+function jsonError(status: number, message: string): Response {
+  return new Response(JSON.stringify({ error: message }), {
+    status,
+    headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
+  });
+}
 
-console.log(`✅ Streaming Service running on http://localhost:${PORT}`);
+// ─── Start ────────────────────────────────────────────────────────────────────
+
+console.log(`\n🚀 Telegram Streaming Service`);
+console.log(`   Port      : ${PORT}`);
+console.log(`   Chunk     : ${formatBytes(CHUNK_SIZE)} (fixed, always aligned)`);
+console.log(`   Max Resp  : ${formatBytes(MAX_RESPONSE_SIZE)}`);
+console.log(`   API ID    : ${API_ID || "⚠️  NOT SET"}`);
+
+serve({ port: PORT, fetch: handleRequest, idleTimeout: 120 });
+
+console.log(`✅ Ready → http://localhost:${PORT}\n`);
