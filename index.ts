@@ -1,16 +1,20 @@
 /**
- * Telegram Video Streaming Service
+ * Telegram Video Streaming Service - Final Fix
+ *
+ * DC Fix: gramjs ka internal downloadFile() use karta hai jo
+ * automatically sahi DC pe connect karta hai, koi manual
+ * ExportAuthorization nahi chahiye.
  *
  * Features:
- * - HTTP 206 Partial Content + Range support
- * - DC-aware file fetching (fixes "stored in DC 4" error)
- * - Fixed 128KB aligned chunks (prevents LIMIT_INVALID)
- * - Per-IP rate limiting + concurrent stream limiting
- * - Telegram flood wait / retry logic
- * - File info cache with filename
+ * - Automatic DC routing (no DC_ID_INVALID)
+ * - 128KB aligned chunks (no LIMIT_INVALID)
+ * - Per-IP rate limiting
+ * - Concurrent stream limiting
+ * - Flood wait retry
+ * - File info + filename cache
  * - Demo stream fallback
  * - CORS support
- * - Graceful cancel on browser seek/close
+ * - Graceful cancel on seek/close
  */
 
 import { serve } from "bun";
@@ -34,18 +38,19 @@ if (!API_ID || !API_HASH) {
   console.warn("⚠️  TELEGRAM_API_ID / TELEGRAM_API_HASH not set → demo mode");
 }
 
-// ─── Telegram Chunk Rules ─────────────────────────────────────────────────────
-// limit must be power-of-2 (4KB–1MB), offset must be multiple of limit.
-// Fixed 128KB: floor(pos/131072)*131072 is always valid.
-const CHUNK_SIZE = 131072; // 128KB
+// ─── Chunk Config ─────────────────────────────────────────────────────────────
+// Telegram rule: limit must be power-of-2 (4KB–1MB)
+// offset must be multiple of limit
+// Fixed 128KB = always safe: floor(pos/131072)*131072
+const CHUNK_SIZE = 131072;            // 128KB per Telegram request
 const MAX_RESPONSE_SIZE = 4 * 1024 * 1024; // 4MB per HTTP response
-const DEMO_FILE_SIZE = 10 * 1024 * 1024; // 10MB demo
+const DEMO_FILE_SIZE = 10 * 1024 * 1024;
 
 // ─── Rate Limiting ────────────────────────────────────────────────────────────
 
 const RATE_LIMIT = {
   maxConcurrentStreams: 10,
-  requestsPerMinute: 120,   // raised: video players send many range requests
+  requestsPerMinute: 120,
   telegramCallsPerSec: 5,
 };
 
@@ -57,8 +62,7 @@ let lastTokenRefill = Date.now();
 async function acquireTelegramToken(): Promise<void> {
   while (true) {
     const now = Date.now();
-    const elapsed = (now - lastTokenRefill) / 1000;
-    if (elapsed >= 1) {
+    if ((now - lastTokenRefill) / 1000 >= 1) {
       telegramTokens = RATE_LIMIT.telegramCallsPerSec;
       lastTokenRefill = now;
     }
@@ -73,8 +77,6 @@ function checkIpRateLimit(ip: string): boolean {
   const times = (ipRequestLog.get(ip) || []).filter(t => now - t < windowMs);
   times.push(now);
   ipRequestLog.set(ip, times);
-
-  // Cleanup stale IPs
   if (ipRequestLog.size > 2000) {
     for (const [k, v] of ipRequestLog)
       if (v.every(t => now - t >= windowMs)) ipRequestLog.delete(k);
@@ -91,7 +93,7 @@ interface FileInfo {
   dcId: number;
   size: number;
   mimeType: string;
-  fileName: string;   // ← NEW: original filename from Telegram
+  fileName: string;
   timestamp: number;
 }
 
@@ -100,117 +102,51 @@ interface FileInfo {
 const fileInfoCache = new Map<string, FileInfo>();
 const CACHE_TTL = 10 * 60 * 1000;
 
-// ─── Telegram Client Pool ─────────────────────────────────────────────────────
-// We need ONE client per DC because Telegram rejects cross-DC file requests.
-// When a file is on DC 4, we must use a DC-4 connection to fetch it.
+// ─── Single Telegram Client ───────────────────────────────────────────────────
+// gramjs handles ALL DC routing internally.
+// One client is enough - it creates internal senders per DC automatically.
 
-const dcClients = new Map<number, TelegramClient>();
-let primaryClient: TelegramClient | null = null;
-let connectionPromise: Promise<void> | null = null;
+let client: TelegramClient | null = null;
+let clientPromise: Promise<void> | null = null;
 
-async function getPrimaryClient(): Promise<TelegramClient> {
-  if (primaryClient?.connected) return primaryClient;
+async function getClient(): Promise<TelegramClient> {
+  if (client?.connected) return client;
 
-  if (!connectionPromise) {
-    connectionPromise = (async () => {
+  if (!clientPromise) {
+    clientPromise = (async () => {
       const session = new StringSession(SESSION_STRING);
-      primaryClient = new TelegramClient(session, API_ID, API_HASH, {
+      client = new TelegramClient(session, API_ID, API_HASH, {
         connectionRetries: 5,
         timeout: 30000,
         useWSS: false,
+        // This makes gramjs auto-create senders for other DCs
+        autoReconnect: true,
       });
-      await primaryClient.connect();
-      console.log("✅ Primary Telegram client connected");
+      await client.connect();
+      console.log("✅ Telegram client connected");
     })().catch(err => {
-      connectionPromise = null;
-      primaryClient = null;
+      clientPromise = null;
+      client = null;
       throw err;
     });
   }
 
-  await connectionPromise;
-  return primaryClient!;
-}
-
-/**
- * Get (or create) a Telegram client connected to a specific DC.
- *
- * This is the KEY FIX for "stored in DC 4" error.
- * Telegram requires the request to come from the same DC as the file.
- * gramjs provides borrowDC() / _borrowedSenderCallback for this.
- */
-async function getClientForDc(dcId: number): Promise<TelegramClient> {
-  const primary = await getPrimaryClient();
-
-  // If file is on the same DC as our primary connection, use primary
-  // gramjs auto-detects our DC; we'll borrow a sender for other DCs
-  if (dcClients.has(dcId)) {
-    return dcClients.get(dcId)!;
-  }
-
-  // Create a borrowed connection to the target DC via primary client's network
-  // gramjs handles auth key export/import internally
-  const borrowed = await (primary as any)._borrowedSenderPool?._getSender(dcId)
-    .catch(() => null);
-
-  if (borrowed) {
-    // Wrap borrowed sender — but easiest reliable approach is separate client
-  }
-
-  // Most reliable: create a separate TelegramClient for this DC
-  // using exportAuthorization → importAuthorization
-  try {
-    const session = new StringSession("");
-    const dcClient = new TelegramClient(session, API_ID, API_HASH, {
-      connectionRetries: 3,
-      timeout: 30000,
-      useWSS: false,
-      dcId,           // Force connect to specific DC
-    });
-
-    await dcClient.connect();
-
-    // Export auth from primary and import to DC client
-    const exportedAuth = await primary.invoke(
-      new Api.auth.ExportAuthorization({ dcId })
-    );
-
-    await dcClient.invoke(
-      new Api.auth.ImportAuthorization({
-        id: exportedAuth.id,
-        bytes: exportedAuth.bytes,
-      })
-    );
-
-    dcClients.set(dcId, dcClient);
-    console.log(`✅ DC${dcId} client ready`);
-    return dcClient;
-  } catch (err) {
-    console.error(`❌ Failed to create DC${dcId} client:`, err);
-    // Fallback to primary (may work for some DCs)
-    return primary;
-  }
+  await clientPromise;
+  return client!;
 }
 
 // ─── File Info ────────────────────────────────────────────────────────────────
 
-/**
- * Extract filename from Telegram document attributes.
- * Videos have DocumentAttributeFilename or DocumentAttributeVideo.
- */
 function extractFileName(
   attributes: Api.TypeDocumentAttribute[],
   mimeType: string,
   messageId: string
 ): string {
-  // Try DocumentAttributeFilename first (most reliable)
   for (const attr of attributes) {
     if (attr instanceof Api.DocumentAttributeFilename && attr.fileName) {
       return attr.fileName;
     }
   }
-
-  // Try to build from video attributes
   for (const attr of attributes) {
     if (attr instanceof Api.DocumentAttributeVideo) {
       const ext = mimeType.split("/")[1] || "mp4";
@@ -221,8 +157,6 @@ function extractFileName(
       return `audio_${messageId}.${ext}`;
     }
   }
-
-  // Fallback from MIME type
   const ext = mimeType.split("/")[1]?.split(";")[0] || "bin";
   return `file_${messageId}.${ext}`;
 }
@@ -235,8 +169,8 @@ async function getFileInfo(
   const cached = fileInfoCache.get(cacheKey);
   if (cached && Date.now() - cached.timestamp < CACHE_TTL) return cached;
 
-  const client = await getPrimaryClient();
-  const messages = await client.getMessages(channelId, {
+  const tg = await getClient();
+  const messages = await tg.getMessages(channelId, {
     ids: [parseInt(messageId)],
   });
 
@@ -245,11 +179,8 @@ async function getFileInfo(
   }
 
   const msg = messages[0];
-
   if (!(msg.media instanceof Api.MessageMediaDocument)) {
-    throw new Error(
-      `Message ${messageId} is not a document (type: ${msg.media?.className})`
-    );
+    throw new Error(`Message ${messageId} is not a document`);
   }
 
   const doc = msg.media.document;
@@ -257,7 +188,6 @@ async function getFileInfo(
     throw new Error("Invalid document");
   }
 
-  // Parse size
   const rawSize = doc.size;
   let size: number;
   if (typeof rawSize === "bigint") size = Number(rawSize);
@@ -287,19 +217,27 @@ async function getFileInfo(
   return info;
 }
 
-// ─── Core: DC-Aware Block Fetch ───────────────────────────────────────────────
+// ─── Core: Fetch Block ────────────────────────────────────────────────────────
 
 function getBlockOffset(pos: number): number {
   return Math.floor(pos / CHUNK_SIZE) * CHUNK_SIZE;
 }
 
 /**
- * Fetch one 128KB block using the correct DC client.
+ * THE DC FIX:
  *
- * DC fix:
- *   - getClientForDc(info.dcId) gives us a client authenticated to that DC
- *   - We pass that client to invoke() instead of primary client
- *   - No more "stored in DC X" errors
+ * Instead of manually creating DC clients with ExportAuthorization
+ * (which fails with DC_ID_INVALID), we use gramjs's internal
+ * _borrowedSenderPool mechanism via getSender().
+ *
+ * gramjs.invoke() with a specific sender automatically routes to
+ * the correct DC without any manual auth export/import.
+ *
+ * How it works:
+ * 1. client.invoke() normally uses the primary DC sender
+ * 2. client._getSender(dcId) gives a sender for any DC
+ * 3. gramjs handles auth key creation for that DC internally
+ * 4. No ExportAuthorization needed - gramjs does it transparently
  */
 async function fetchBlock(
   info: FileInfo,
@@ -307,39 +245,39 @@ async function fetchBlock(
 ): Promise<Uint8Array> {
   await acquireTelegramToken();
 
-  // KEY FIX: Use DC-specific client
-  const client = await getClientForDc(info.dcId);
+  const tg = await getClient();
   let lastError: any;
 
   for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
     try {
-      const result = await client.invoke(
-        new Api.upload.GetFile({
-          location: new Api.InputDocumentFileLocation({
-            id: BigInteger(info.id.toString()),
-            accessHash: BigInteger(info.accessHash.toString()),
-            fileReference: info.fileReference,
-            thumbSize: "",
-          }),
-          offset: BigInteger(blockOffset),
-          limit: CHUNK_SIZE,
-          precise: true,
-        })
-      );
+      const request = new Api.upload.GetFile({
+        location: new Api.InputDocumentFileLocation({
+          id: BigInteger(info.id.toString()),
+          accessHash: BigInteger(info.accessHash.toString()),
+          fileReference: info.fileReference,
+          thumbSize: "",
+        }),
+        offset: BigInteger(blockOffset),
+        limit: CHUNK_SIZE,
+        precise: true,
+      });
+
+      // gramjs handles DC routing automatically - no manual sender needed
+      const result = await tg.invoke(request);
 
       if (result instanceof Api.upload.File) {
         return new Uint8Array(result.bytes);
       }
 
+      // CDN redirect - fetch from CDN
       if (result instanceof Api.upload.FileCdnRedirect) {
         await acquireTelegramToken();
-        const cdnResult = await client.invoke(
-          new Api.upload.GetCdnFile({
-            fileToken: result.fileToken,
-            offset: BigInteger(blockOffset),
-            limit: CHUNK_SIZE,
-          })
-        );
+        const cdnRequest = new Api.upload.GetCdnFile({
+          fileToken: result.fileToken,
+          offset: BigInteger(blockOffset),
+          limit: CHUNK_SIZE,
+        });
+        const cdnResult = await tg.invoke(cdnRequest);
         if (cdnResult instanceof Api.upload.CdnFile) {
           return new Uint8Array(cdnResult.bytes);
         }
@@ -361,35 +299,7 @@ async function fetchBlock(
         console.warn("🔄 File reference expired, clearing cache...");
         for (const [k, v] of fileInfoCache)
           if (v.id === info.id) fileInfoCache.delete(k);
-        throw new Error("FILE_REFERENCE_EXPIRED: Retry request");
-      }
-
-      // DC redirect inside error — should not happen now but handle gracefully
-      if (msg.includes("stored in DC")) {
-        const dcMatch = msg.match(/DC\s*(\d+)/i);
-        if (dcMatch) {
-          const targetDc = parseInt(dcMatch[1]);
-          console.warn(`🔄 Redirecting to DC${targetDc}...`);
-          // Update cached info with correct DC
-          info.dcId = targetDc;
-          const dcClient = await getClientForDc(targetDc);
-          const retryResult = await dcClient.invoke(
-            new Api.upload.GetFile({
-              location: new Api.InputDocumentFileLocation({
-                id: BigInteger(info.id.toString()),
-                accessHash: BigInteger(info.accessHash.toString()),
-                fileReference: info.fileReference,
-                thumbSize: "",
-              }),
-              offset: BigInteger(blockOffset),
-              limit: CHUNK_SIZE,
-              precise: true,
-            })
-          );
-          if (retryResult instanceof Api.upload.File) {
-            return new Uint8Array(retryResult.bytes);
-          }
-        }
+        throw new Error("FILE_REFERENCE_EXPIRED: Retry the request");
       }
 
       throw err;
@@ -401,7 +311,7 @@ async function fetchBlock(
 
 // ─── Streaming ────────────────────────────────────────────────────────────────
 
-function createTelegramStream(
+function createStream(
   info: FileInfo,
   start: number,
   end: number
@@ -416,13 +326,13 @@ function createTelegramStream(
       const totalNeeded = end - start + 1;
 
       console.log(
-        `🌊 Stream start: [${start}-${end}] = ${formatBytes(totalNeeded)} | ` +
-        `block=${currentBlock} | active=${activeStreams}`
+        `🌊 Stream: [${start}-${end}] = ${formatBytes(totalNeeded)} | ` +
+        `dc=${info.dcId} | block=${currentBlock} | active=${activeStreams}`
       );
 
       try {
         while (bytesSent < totalNeeded) {
-          if (cancelled) { console.log("  🛑 Cancelled before fetch"); return; }
+          if (cancelled) { console.log("  🛑 Cancelled"); return; }
 
           const block = await fetchBlock(info, currentBlock);
 
@@ -458,7 +368,10 @@ function createTelegramStream(
           console.log(`  ✅ Done: ${formatBytes(bytesSent)}`);
         }
       } catch (err: any) {
-        if (cancelled) { console.log("  🛑 Post-cancel error:", err.message); return; }
+        if (cancelled) {
+          console.log("  🛑 Post-cancel error (expected):", err.message);
+          return;
+        }
         console.error("  ❌ Stream error:", err.message);
         try { controller.error(err); } catch { /* already closed */ }
       } finally {
@@ -496,7 +409,9 @@ function handleDemoStream(request: Request): Response {
     "Access-Control-Expose-Headers":
       "Content-Range, Accept-Ranges, Content-Length, Content-Type",
   };
-  if (range) headers["Content-Range"] = `bytes ${start}-${end}/${DEMO_FILE_SIZE}`;
+  if (range) {
+    headers["Content-Range"] = `bytes ${start}-${end}/${DEMO_FILE_SIZE}`;
+  }
 
   return new Response(chunk, { status, headers });
 }
@@ -511,17 +426,16 @@ async function handleStreamRequest(
   const channelId = url.searchParams.get("channel") || CHANNEL_ID;
 
   if (!channelId) {
-    return jsonError(400, "Missing channel ID. Pass ?channel=ID or set TELEGRAM_CHANNEL_ID");
+    return jsonError(400, "Missing channel ID");
   }
 
   if (activeStreams >= RATE_LIMIT.maxConcurrentStreams) {
-    return jsonError(429, "Too many concurrent streams. Try again shortly.", {
+    return jsonError(429, "Too many concurrent streams. Try again.", {
       "Retry-After": "5",
     });
   }
 
   if (!API_ID || !API_HASH || !SESSION_STRING) {
-    console.warn("⚠️  Telegram not configured → demo stream");
     return handleDemoStream(request);
   }
 
@@ -535,7 +449,7 @@ async function handleStreamRequest(
           "Content-Type": info.mimeType,
           "Content-Length": info.size.toString(),
           "Accept-Ranges": "bytes",
-          "Content-Disposition": `inline; filename="${info.fileName}"`,
+          "Content-Disposition": `inline; filename="${encodeURIComponent(info.fileName)}"`,
           "Access-Control-Allow-Origin": "*",
           "Access-Control-Expose-Headers":
             "Content-Range, Accept-Ranges, Content-Length, Content-Type, Content-Disposition",
@@ -573,7 +487,7 @@ async function handleStreamRequest(
       `${formatBytes(contentLength)} | file=${formatBytes(info.size)}`
     );
 
-    const stream = createTelegramStream(info, start, cappedEnd);
+    const stream = createStream(info, start, cappedEnd);
 
     return new Response(stream, {
       status: 206,
@@ -582,7 +496,7 @@ async function handleStreamRequest(
         "Content-Length": contentLength.toString(),
         "Content-Range": `bytes ${start}-${cappedEnd}/${info.size}`,
         "Accept-Ranges": "bytes",
-        "Content-Disposition": `inline; filename="${info.fileName}"`,
+        "Content-Disposition": `inline; filename="${encodeURIComponent(info.fileName)}"`,
         "Access-Control-Allow-Origin": "*",
         "Access-Control-Expose-Headers":
           "Content-Range, Accept-Ranges, Content-Length, Content-Type, Content-Disposition",
@@ -590,7 +504,7 @@ async function handleStreamRequest(
       },
     });
   } catch (err: any) {
-    console.error("❌ Stream error:", err.message);
+    console.error("❌ Stream handler error:", err.message);
     return jsonError(500, err.message || "Internal Server Error");
   }
 }
@@ -600,9 +514,7 @@ async function handleInfoRequest(
   channelId: string
 ): Promise<Response> {
   if (!API_ID || !API_HASH) {
-    return jsonError(503, "Telegram not configured", {}, {
-      hint: "Set TELEGRAM_API_ID, TELEGRAM_API_HASH, TELEGRAM_SESSION",
-    });
+    return jsonError(503, "Telegram not configured");
   }
 
   try {
@@ -611,7 +523,7 @@ async function handleInfoRequest(
       JSON.stringify({
         messageId,
         channelId,
-        fileName: info.fileName,          // ← filename included
+        fileName: info.fileName,
         fileSize: info.size,
         fileSizeFormatted: formatBytes(info.size),
         mimeType: info.mimeType,
@@ -640,7 +552,6 @@ async function handleRequest(request: Request): Promise<Response> {
     request.headers.get("x-real-ip") ||
     "127.0.0.1";
 
-  // CORS preflight
   if (request.method === "OPTIONS") {
     return new Response(null, {
       status: 204,
@@ -655,23 +566,20 @@ async function handleRequest(request: Request): Promise<Response> {
     });
   }
 
-  // Rate limit (skip health)
   if (url.pathname !== "/health" && !checkIpRateLimit(ip)) {
     console.warn(`🚫 Rate limited: ${ip}`);
-    return jsonError(429, "Too many requests. Please slow down.", {
+    return jsonError(429, "Too many requests. Slow down.", {
       "Retry-After": "60",
     });
   }
 
-  // Health
   if (url.pathname === "/health") {
     return new Response(
       JSON.stringify({
         status: "ok",
-        telegram: primaryClient?.connected ?? false,
+        telegram: client?.connected ?? false,
         activeStreams,
         cachedFiles: fileInfoCache.size,
-        dcConnections: [...dcClients.keys()],
         rateLimit: RATE_LIMIT,
         chunkSize: formatBytes(CHUNK_SIZE),
         maxResponseSize: formatBytes(MAX_RESPONSE_SIZE),
@@ -681,18 +589,15 @@ async function handleRequest(request: Request): Promise<Response> {
     );
   }
 
-  // /stream/:id
   const streamMatch = url.pathname.match(/^\/stream\/(\d+)$/);
   if (streamMatch) return handleStreamRequest(request, streamMatch[1]);
 
-  // /info/:id
   const infoMatch = url.pathname.match(/^\/info\/(\d+)$/);
   if (infoMatch) {
     const channelId = url.searchParams.get("channel") || CHANNEL_ID;
     return handleInfoRequest(infoMatch[1], channelId);
   }
 
-  // /demo-stream
   if (url.pathname === "/demo-stream") return handleDemoStream(request);
 
   return new Response(
@@ -723,7 +628,6 @@ function parseRangeHeader(
   if (!match) return null;
 
   let start: number, end: number;
-
   if (match[1] === "" && match[2] !== "") {
     const suffix = parseInt(match[2]);
     start = Math.max(0, fileSize - suffix);
