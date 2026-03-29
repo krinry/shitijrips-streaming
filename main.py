@@ -65,7 +65,7 @@ class Config:
     max_response_bytes:   int = 5 * 1024 * 1024
     demo_file_size:       int = 10 * 1024 * 1024
 
-    max_concurrent_streams: int = 5
+    max_concurrent_streams: int = int(os.environ.get("MAX_CONCURRENT_STREAMS", "5"))
     requests_per_minute:    int = 120
     max_ip_log_size:        int = 5000
 
