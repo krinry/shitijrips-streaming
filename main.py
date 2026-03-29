@@ -258,34 +258,38 @@ async def fetch_file_info(message_id: int, channel_id: str) -> FileInfo:
     if cached:
         return cached
 
-    msg = await tg.get_messages(channel_id, message_id)
+    messages = await tg.get_messages(channel_id, message_id)
+    msg = messages[0] if isinstance(messages, list) else messages
 
-    if not msg or msg.empty:
+    if not msg:
         raise ValueError(f"Message {message_id} not found in {channel_id}")
 
-    doc = msg.document or msg.video or msg.audio or msg.voice or msg.video_note
+    doc = getattr(msg, "document", None) or getattr(msg, "video", None) or getattr(msg, "audio", None) or getattr(msg, "voice", None) or getattr(msg, "video_note", None)
     if not doc:
         raise ValueError(f"Message {message_id} has no streamable media")
 
     mime      = getattr(doc, "mime_type", None) or "video/mp4"
     file_name = _extract_filename(msg)
+    file_ref  = getattr(doc, "file_reference", None) or b""
+    file_size = getattr(doc, "file_size", 0) or 0
+    dc_id     = getattr(doc, "dc_id", None) or 0
 
     info = FileInfo(
         message_id = message_id,
         channel_id = channel_id,
-        file_id    = doc.file_id,
-        file_ref   = doc.file_reference,
-        file_size  = doc.file_size,
+        file_id    = getattr(doc, "file_id", ""),
+        file_ref   = file_ref,
+        file_size  = file_size,
         mime_type  = mime,
         file_name  = file_name,
-        dc_id      = doc.dc_id,
+        dc_id      = dc_id,
         message    = msg,
     )
 
     file_cache.set(info)
     log.info(
         f'📁 Cached | msg={message_id} | "{file_name}" | '
-        f'{fmt_bytes(doc.file_size)} | dc={doc.dc_id} | {mime}'
+        f'{fmt_bytes(file_size)} | dc={dc_id} | {mime}'
     )
     return info
 
@@ -585,8 +589,11 @@ async def stream_video(
             headers     = {"Retry-After": "5", "Content-Type": "application/json"},
         )
 
-    # Demo fallback
-    if not tg.is_connected:
+    # Demo fallback if not connected
+    try:
+        if not tg.is_connected:
+            return _demo_response(request)
+    except Exception:
         return _demo_response(request)
 
     # Fetch file info
